@@ -33,11 +33,20 @@ def test_service_builds_output_document_with_stats(tmp_path: Path) -> None:
     (photos / "broken.jpg").write_bytes(b"fake-image")
     (photos / "note.txt").write_text("ignore me", encoding="utf-8")
 
-    service = PhotoDescriptionService(vision_client=FakeVisionClient())
+    service = PhotoDescriptionService(
+        vision_client=FakeVisionClient(),
+        model_name="test-model",
+        base_url="http://example.test/v1",
+    )
 
     document = service.describe_directory(photos, recursive=False)
 
     assert document["input"]["directory"] == str(photos.resolve())
+    assert document["model"] == {
+        "provider": "openai_compatible",
+        "name": "test-model",
+        "base_url": "http://example.test/v1",
+    }
     assert document["summary"]["total_files"] == 3
     assert document["summary"]["processed"] == 2
     assert document["summary"]["failed"] == 1
@@ -61,9 +70,18 @@ def test_service_can_write_json_output(tmp_path: Path) -> None:
     Image.new("RGB", (8, 8), color="white").save(photos / "sample.jpg", format="JPEG")
     output_path = tmp_path / "descriptions.json"
 
-    service = PhotoDescriptionService(vision_client=FakeVisionClient())
+    service = PhotoDescriptionService(
+        vision_client=FakeVisionClient(),
+        model_name="test-model",
+        base_url="http://example.test/v1",
+    )
 
     service.describe_to_file(photos, output_path, recursive=False)
 
     written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["model"] == {
+        "provider": "openai_compatible",
+        "name": "test-model",
+        "base_url": "http://example.test/v1",
+    }
     assert written["summary"]["processed"] == 1

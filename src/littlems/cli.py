@@ -17,7 +17,11 @@ def build_service(settings: Settings) -> PhotoDescriptionService:
         api_key=settings.api_key,
         model=settings.vision_model,
     )
-    return PhotoDescriptionService(vision_client=client, model_name=settings.vision_model)
+    return PhotoDescriptionService(
+        vision_client=client,
+        model_name=settings.vision_model,
+        base_url=settings.base_url,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

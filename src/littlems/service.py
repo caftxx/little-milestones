@@ -18,9 +18,15 @@ class VisionClient(Protocol):
 
 
 class PhotoDescriptionService:
-    def __init__(self, vision_client: VisionClient, model_name: str = "local-vision-model") -> None:
+    def __init__(
+        self,
+        vision_client: VisionClient,
+        model_name: str = "local-vision-model",
+        base_url: str | None = None,
+    ) -> None:
         self._vision_client = vision_client
         self._model_name = model_name
+        self._base_url = base_url
 
     def describe_directory(self, input_dir: Path, recursive: bool = False) -> dict[str, object]:
         logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
@@ -54,7 +60,8 @@ class PhotoDescriptionService:
                 "recursive": recursive,
             },
             "model": {
-                "provider": "openai_compatible_local",
+                "provider": "openai_compatible",
+                "base_url": self._base_url,
                 "name": self._model_name,
             },
             "summary": {

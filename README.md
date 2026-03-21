@@ -1,5 +1,7 @@
 # Little Milestones
 
+[![Tests](https://github.com/caftxx/little-milestones/actions/workflows/tests.yml/badge.svg)](https://github.com/caftxx/little-milestones/actions/workflows/tests.yml)
+
 **AI-powered monthly growth reports for babies and pets**
 
 Little Milestones 是一个围绕成长记录整理的小工具项目。

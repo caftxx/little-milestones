@@ -131,7 +131,3 @@ uv run littlems describe \
 ```bash
 uv run --extra dev pytest
 ```
-
-## GitHub About
-
-**Turn photo descriptions and event records into warm monthly growth reports for babies and pets.**

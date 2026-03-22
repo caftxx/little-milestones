@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from PIL import Image, ImageOps
+from PIL import ImageOps
 
 from littlems.config import ProviderSettings
+from littlems.imaging import open_image
 from littlems.models import (
     PhotoMetadata,
     VisionDescription,
@@ -29,6 +30,7 @@ MAX_INLINE_IMAGE_DIMENSION = 4096
 NORMALIZED_IMAGE_DIMENSION = 1536
 NORMALIZED_IMAGE_QUALITY = 80
 DEFAULT_REQUEST_TIMEOUT = 60.0
+ALWAYS_NORMALIZE_SUFFIXES = {"dng", "heif", "heic"}
 
 
 class OpenAIVisionClient:
@@ -342,19 +344,23 @@ def _encode_image_as_data_url(image_path: Path) -> str:
 
 def _prepare_image_bytes(image_path: Path) -> tuple[str, bytes]:
     file_size = image_path.stat().st_size
-    with Image.open(image_path) as image:
+    suffix = image_path.suffix.lower().lstrip(".") or "jpeg"
+    with open_image(image_path) as image:
         width, height = image.size
-    if file_size <= MAX_INLINE_IMAGE_BYTES and max(width, height) <= MAX_INLINE_IMAGE_DIMENSION:
-        return _mime_type_for_suffix(image_path.suffix.lower().lstrip(".") or "jpeg"), image_path.read_bytes()
+        if (
+            suffix not in ALWAYS_NORMALIZE_SUFFIXES
+            and file_size <= MAX_INLINE_IMAGE_BYTES
+            and max(width, height) <= MAX_INLINE_IMAGE_DIMENSION
+        ):
+            return _mime_type_for_suffix(suffix), image_path.read_bytes()
 
-    logger.info(
-        "normalizing image for model input image=%s size=%sx%s bytes=%s",
-        image_path,
-        width,
-        height,
-        file_size,
-    )
-    with Image.open(image_path) as image:
+        logger.info(
+            "normalizing image for model input image=%s size=%sx%s bytes=%s",
+            image_path,
+            width,
+            height,
+            file_size,
+        )
         normalized = ImageOps.exif_transpose(image).convert("RGB")
         normalized.thumbnail((NORMALIZED_IMAGE_DIMENSION, NORMALIZED_IMAGE_DIMENSION))
         buffer = io.BytesIO()
@@ -375,6 +381,9 @@ def _mime_type_for_suffix(suffix: str) -> str:
         "jpeg": "image/jpeg",
         "png": "image/png",
         "webp": "image/webp",
+        "heif": "image/heif",
+        "heic": "image/heic",
+        "dng": "image/x-adobe-dng",
     }.get(suffix, f"image/{suffix}")
 
 

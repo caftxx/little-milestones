@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".dng", ".heif", ".heic"}
 logger = logging.getLogger(__name__)
 
 

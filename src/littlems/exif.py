@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 import logging
+import re
 from fractions import Fraction
+from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, UnidentifiedImageError
+from PIL import UnidentifiedImageError
 
+from littlems.imaging import open_image
 from littlems.models import PhotoMetadata
 
 
 DEFAULT_GPS = {"latitude": 30.346701, "longitude": 120.002066}
 logger = logging.getLogger(__name__)
+_FILENAME_DATETIME_PATTERN = re.compile(
+    r"(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})[_-]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})"
+)
 
 
 def extract_photo_metadata(image_path: Path) -> PhotoMetadata:
     try:
-        with Image.open(image_path) as image:
+        with open_image(image_path) as image:
             exif = image.getexif()
             exif_ifd = exif.get_ifd(34665) if hasattr(exif, "get_ifd") else {}
             gps_ifd = exif.get_ifd(34853) if hasattr(exif, "get_ifd") else {}
@@ -31,6 +37,8 @@ def extract_photo_metadata(image_path: Path) -> PhotoMetadata:
             if timezone:
                 metadata.timezone = str(timezone)
                 metadata.metadata_source["timezone"] = "exif"
+
+            _apply_datetime_fallbacks(metadata, image_path)
 
             make = exif.get(271)
             model = exif.get(272)
@@ -56,6 +64,68 @@ def extract_photo_metadata(image_path: Path) -> PhotoMetadata:
     except UnidentifiedImageError as exc:
         logger.warning("cannot decode image=%s", image_path)
         raise RuntimeError("cannot decode") from exc
+
+
+def _apply_datetime_fallbacks(metadata: PhotoMetadata, image_path: Path) -> None:
+    filename_datetime = _datetime_from_filename(image_path)
+    if filename_datetime is not None:
+        if metadata.captured_at is None:
+            metadata.captured_at = filename_datetime.strftime("%Y-%m-%dT%H:%M:%S")
+            metadata.metadata_source["captured_at"] = "file_name"
+        if metadata.timezone is None:
+            timezone = _format_utc_offset(filename_datetime)
+            if timezone is not None:
+                metadata.timezone = timezone
+                metadata.metadata_source["timezone"] = "inferred_local"
+        return
+
+    file_datetime = _datetime_from_file_timestamp(image_path)
+    if file_datetime is None:
+        return
+    if metadata.captured_at is None:
+        metadata.captured_at = file_datetime.strftime("%Y-%m-%dT%H:%M:%S")
+        metadata.metadata_source["captured_at"] = "file_timestamp"
+    if metadata.timezone is None:
+        timezone = _format_utc_offset(file_datetime)
+        if timezone is not None:
+            metadata.timezone = timezone
+            metadata.metadata_source["timezone"] = "file_timestamp"
+
+
+def _datetime_from_filename(image_path: Path) -> datetime | None:
+    match = _FILENAME_DATETIME_PATTERN.search(image_path.stem)
+    if match is None:
+        return None
+    try:
+        naive = datetime(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+            int(match.group("hour")),
+            int(match.group("minute")),
+            int(match.group("second")),
+        )
+    except ValueError:
+        return None
+    return naive.astimezone()
+
+
+def _datetime_from_file_timestamp(image_path: Path) -> datetime | None:
+    stat_result = image_path.stat()
+    timestamp = getattr(stat_result, "st_birthtime", None)
+    if timestamp is None:
+        timestamp = stat_result.st_ctime
+    try:
+        return datetime.fromtimestamp(timestamp).astimezone()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _format_utc_offset(value: datetime) -> str | None:
+    offset = value.strftime("%z")
+    if not offset:
+        return None
+    return f"{offset[:3]}:{offset[3:]}"
 
 
 def _parse_gps(gps_ifd: dict[int, object]) -> dict[str, float] | None:

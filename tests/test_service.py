@@ -9,6 +9,7 @@ from PIL import Image
 from littlems.models import VisionDescription, VisionProvider, VisionProviderAttempt, VisionResult
 from littlems.service import PhotoDescriptionService
 from littlems.vision import VisionProviderFailure
+from littlems.models import PhotoMetadata
 
 
 def _attempt(
@@ -134,6 +135,62 @@ def test_service_can_write_json_output(tmp_path: Path) -> None:
     }
     assert written["summary"]["processed"] == 1
     assert isinstance(written["summary"]["wall_clock_ms"], int)
+
+
+def test_service_builds_stats_for_mixed_supported_formats(monkeypatch, tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.heif", "b.dng", "skip.txt"):
+        (photos / name).write_bytes(b"data")
+
+    class MixedFormatVisionClient:
+        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+            windows = {
+                "a.heif": (0, 10),
+                "b.dng": (10, 25),
+            }
+            start_ms, end_ms = windows[image_path.name]
+            return VisionResult(
+                provider=VisionProvider(
+                    name="provider-a",
+                    base_url="http://example.test/v1",
+                    model="test-model",
+                ),
+                provider_elapsed_ms=end_ms - start_ms,
+                provider_attempts=[
+                    _attempt("provider-a", start_ms=start_ms, end_ms=end_ms, ok=True)
+                ],
+                description=VisionDescription(
+                    summary=f"summary for {image_path.name}",
+                    baby_present=True,
+                    actions=[],
+                    expressions=[],
+                    scene="room",
+                    objects=[],
+                    highlights=[],
+                    uncertainty=None,
+                ),
+            )
+
+    monkeypatch.setattr(
+        "littlems.service.extract_photo_metadata",
+        lambda image_path: PhotoMetadata(),
+    )
+
+    service = PhotoDescriptionService(
+        vision_client=MixedFormatVisionClient(),
+        provider_names=["provider-a"],
+    )
+
+    document = asyncio.run(service.describe_directory(photos, recursive=False))
+
+    assert document["summary"]["total_files"] == 2
+    assert document["summary"]["processed"] == 2
+    assert document["summary"]["failed"] == 0
+    assert [item["file_name"] for item in document["records"]] == ["a.heif", "b.dng"]
+    assert document["provider_stats"] == {
+        "provider-a": {"processed": 2, "failed": 0, "wall_clock_ms": 25, "wall_clock_ms_avg": 12},
+    }
 
 
 def test_service_reports_progress_for_successes_and_failures(tmp_path: Path) -> None:

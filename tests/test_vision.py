@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 
@@ -344,6 +345,82 @@ def test_prepare_image_bytes_normalizes_large_image(tmp_path: Path) -> None:
     assert mime_type == "image/jpeg"
     assert len(image_bytes) < image_path.stat().st_size
     assert image_bytes != image_path.read_bytes()
+
+
+def test_prepare_image_bytes_normalizes_heif_into_jpeg(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.heif"
+    image_path.write_bytes(b"heif-data")
+
+    normalized = Image.new("RGB", (8, 8), color="white")
+
+    class FakeImage:
+        size = (8, 8)
+
+        def __enter__(self) -> FakeImage:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def load(self) -> None:
+            return None
+
+        def getexif(self) -> dict[object, object]:
+            return {}
+
+        def copy(self) -> FakeImage:
+            return self
+
+        def convert(self, mode: str) -> Image.Image:
+            assert mode == "RGB"
+            return normalized.copy()
+
+    monkeypatch.setattr("littlems.vision.open_image", lambda path: FakeImage())
+
+    mime_type, image_bytes = _prepare_image_bytes(image_path)
+
+    assert mime_type == "image/jpeg"
+    assert image_bytes != b"heif-data"
+    reopened = Image.open(io.BytesIO(image_bytes))
+    assert reopened.format == "JPEG"
+
+
+def test_prepare_image_bytes_normalizes_dng_into_jpeg(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.dng"
+    image_path.write_bytes(b"dng-data")
+
+    normalized = Image.new("RGB", (8, 8), color="white")
+
+    class FakeImage:
+        size = (8, 8)
+
+        def __enter__(self) -> FakeImage:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def load(self) -> None:
+            return None
+
+        def getexif(self) -> dict[object, object]:
+            return {}
+
+        def copy(self) -> FakeImage:
+            return self
+
+        def convert(self, mode: str) -> Image.Image:
+            assert mode == "RGB"
+            return normalized.copy()
+
+    monkeypatch.setattr("littlems.vision.open_image", lambda path: FakeImage())
+
+    mime_type, image_bytes = _prepare_image_bytes(image_path)
+
+    assert mime_type == "image/jpeg"
+    assert image_bytes != b"dng-data"
+    reopened = Image.open(io.BytesIO(image_bytes))
+    assert reopened.format == "JPEG"
 
 
 def _create_sample_image(tmp_path: Path) -> Path:

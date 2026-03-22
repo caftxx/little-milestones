@@ -114,7 +114,18 @@ def _datetime_from_file_timestamp(image_path: Path) -> datetime | None:
     stat_result = image_path.stat()
     timestamp = getattr(stat_result, "st_birthtime", None)
     if timestamp is None:
-        timestamp = stat_result.st_ctime
+        candidates = [
+            value
+            for value in (
+                getattr(stat_result, "st_atime", None),
+                getattr(stat_result, "st_mtime", None),
+                getattr(stat_result, "st_ctime", None),
+            )
+            if value is not None
+        ]
+        if not candidates:
+            return None
+        timestamp = min(candidates)
     try:
         return datetime.fromtimestamp(timestamp).astimezone()
     except (OSError, OverflowError, ValueError):

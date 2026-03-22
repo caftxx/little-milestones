@@ -119,3 +119,29 @@ def test_extract_photo_metadata_falls_back_to_file_timestamp(monkeypatch, tmp_pa
     assert metadata.timezone is not None
     assert metadata.metadata_source["captured_at"] == "file_timestamp"
     assert metadata.metadata_source["timezone"] == "file_timestamp"
+
+
+def test_extract_photo_metadata_uses_earliest_file_timestamp_when_birthtime_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    photo = tmp_path / "plain-name.dng"
+    photo.write_bytes(b"raw")
+    monkeypatch.setattr("littlems.exif.open_image", lambda path: _EmptyExifImage())
+
+    earliest = datetime(2026, 3, 20, 1, 2, 3).astimezone().timestamp()
+    later = datetime(2026, 3, 21, 4, 5, 6).astimezone().timestamp()
+    latest = datetime(2026, 3, 22, 7, 8, 9).astimezone().timestamp()
+
+    class FakeStat:
+        st_atime = later
+        st_mtime = earliest
+        st_ctime = latest
+
+    monkeypatch.setattr(Path, "stat", lambda self: FakeStat())
+
+    metadata = extract_photo_metadata(photo)
+
+    assert metadata.captured_at == "2026-03-20T01:02:03"
+    assert metadata.timezone is not None
+    assert metadata.metadata_source["captured_at"] == "file_timestamp"
+    assert metadata.metadata_source["timezone"] == "file_timestamp"

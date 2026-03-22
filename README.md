@@ -77,9 +77,12 @@ uv run littlems describe \
 - `--openai-base-url`：覆盖 `OPENAI_BASE_URL`
 - `--openai-api-key`：覆盖 `OPENAI_API_KEY`
 - `--vision-model`：覆盖 `VISION_MODEL`
+- `--log-path`：覆盖日志文件输出路径
 - `--log-level`：设置日志级别，排查问题时可用 `DEBUG`
 
 如果命令行参数和环境变量都未提供，CLI 会直接报错并提示需要补齐配置。
+
+默认情况下，日志会写入当前工作目录下的 `log/littlems.log`，不会打印到终端；终端只显示处理进度条。
 
 调试时可以这样运行：
 
@@ -88,6 +91,15 @@ uv run littlems describe \
   --input ./photos \
   --output ./descriptions.json \
   --log-level DEBUG
+```
+
+如果你想自定义日志文件位置，可以显式传入：
+
+```bash
+uv run littlems describe \
+  --input ./photos \
+  --output ./descriptions.json \
+  --log-path ./runtime/littlems-debug.log
 ```
 
 ## 输出内容

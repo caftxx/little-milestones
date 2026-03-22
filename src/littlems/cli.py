@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 from littlems.config import Settings, load_settings
 from littlems.service import PhotoDescriptionService
 from littlems.vision import OpenAIVisionClient
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="INFO",
         help="Logging verbosity for debugging",
     )
+    describe.add_argument(
+        "--log-path",
+        type=Path,
+        help="Log file output path; defaults to ./log/littlems.log",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.log_level)
+    _configure_logging(args.log_level, _resolve_log_path(args))
 
     if args.command == "describe":
         settings = _resolve_settings(args)
@@ -73,7 +80,23 @@ def main(argv: list[str] | None = None) -> int:
             settings.base_url,
         )
         service = build_service(settings)
-        service.describe_to_file(args.input, args.output, recursive=args.recursive)
+        with tqdm(
+            total=0,
+            desc="Processing photos",
+            unit="image",
+            dynamic_ncols=True,
+        ) as progress:
+            service.describe_to_file(
+                args.input,
+                args.output,
+                recursive=args.recursive,
+                progress_callback=lambda processed, total, image_path: _update_progress(
+                    progress,
+                    processed,
+                    total,
+                    image_path,
+                ),
+            )
         logger.info("describe command finished output=%s", args.output)
         return 0
     parser.error(f"Unsupported command: {args.command}")
@@ -112,11 +135,29 @@ def _clean_base_url(value: str | None) -> str | None:
     return text or None
 
 
-def _configure_logging(level_name: str) -> None:
+def _resolve_log_path(args: argparse.Namespace) -> Path:
+    if args.log_path is not None:
+        return args.log_path
+    return Path.cwd() / "log" / "littlems.log"
+
+
+def _configure_logging(level_name: str, log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=getattr(logging, level_name, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        force=True,
     )
+    logging.captureWarnings(True)
+    logger.debug("logging configured path=%s cwd=%s pid=%s", log_path, Path.cwd(), os.getpid())
+
+
+def _update_progress(progress: tqdm, processed: int, total: int, image_path: Path) -> None:
+    if progress.total != total:
+        progress.total = total
+    progress.set_postfix_str(image_path.name)
+    progress.update(processed - progress.n)
 
 
 if __name__ == "__main__":

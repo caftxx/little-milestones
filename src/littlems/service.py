@@ -17,6 +17,10 @@ class VisionClient(Protocol):
     def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription: ...
 
 
+class ProgressCallback(Protocol):
+    def __call__(self, processed: int, total: int, image_path: Path) -> None: ...
+
+
 class PhotoDescriptionService:
     def __init__(
         self,
@@ -28,14 +32,20 @@ class PhotoDescriptionService:
         self._model_name = model_name
         self._base_url = base_url
 
-    def describe_directory(self, input_dir: Path, recursive: bool = False) -> dict[str, object]:
+    def describe_directory(
+        self,
+        input_dir: Path,
+        recursive: bool = False,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, object]:
         logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
         paths = scan_photo_paths(input_dir, recursive=recursive)
         logger.info("found %s supported image files", len(paths))
         records: list[dict[str, object]] = []
         failures: list[dict[str, str]] = []
+        total = len(paths)
 
-        for image_path in paths:
+        for processed, image_path in enumerate(paths, start=1):
             logger.info("processing image=%s", image_path)
             try:
                 metadata = extract_photo_metadata(image_path)
@@ -52,6 +62,9 @@ class PhotoDescriptionService:
                         "error": str(exc),
                     }
                 )
+            finally:
+                if progress_callback is not None:
+                    progress_callback(processed, total, image_path)
 
         document = {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -80,8 +93,18 @@ class PhotoDescriptionService:
         )
         return document
 
-    def describe_to_file(self, input_dir: Path, output_file: Path, recursive: bool = False) -> None:
-        document = self.describe_directory(input_dir, recursive=recursive)
+    def describe_to_file(
+        self,
+        input_dir: Path,
+        output_file: Path,
+        recursive: bool = False,
+        progress_callback: ProgressCallback | None = None,
+    ) -> None:
+        document = self.describe_directory(
+            input_dir,
+            recursive=recursive,
+            progress_callback=progress_callback,
+        )
         output_file.parent.mkdir(parents=True, exist_ok=True)
         logger.info("writing output json=%s", output_file)
         output_file.write_text(

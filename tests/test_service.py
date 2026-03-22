@@ -85,3 +85,64 @@ def test_service_can_write_json_output(tmp_path: Path) -> None:
         "base_url": "http://example.test/v1",
     }
     assert written["summary"]["processed"] == 1
+
+
+def test_service_reports_progress_for_successes_and_failures(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.jpg", "broken.jpg"):
+        Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
+
+    class MixedVisionClient:
+        def describe(self, image_path: Path, metadata: object) -> VisionDescription:
+            if image_path.name == "broken.jpg":
+                raise RuntimeError("boom")
+            return VisionDescription(
+                summary="ok",
+                baby_present=True,
+                actions=[],
+                expressions=[],
+                scene="room",
+                objects=[],
+                highlights=[],
+                uncertainty=None,
+            )
+
+    service = PhotoDescriptionService(
+        vision_client=MixedVisionClient(),
+        model_name="test-model",
+        base_url="http://example.test/v1",
+    )
+
+    progress_events: list[tuple[int, int, str]] = []
+    document = service.describe_directory(
+        photos,
+        progress_callback=lambda processed, total, image_path: progress_events.append(
+            (processed, total, image_path.name)
+        ),
+    )
+
+    assert document["summary"] == {"total_files": 2, "processed": 1, "failed": 1}
+    assert progress_events == [(1, 2, "a.jpg"), (2, 2, "broken.jpg")]
+
+
+def test_service_handles_empty_directory_without_progress(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+
+    service = PhotoDescriptionService(
+        vision_client=FakeVisionClient(),
+        model_name="test-model",
+        base_url="http://example.test/v1",
+    )
+
+    progress_events: list[tuple[int, int, str]] = []
+    document = service.describe_directory(
+        photos,
+        progress_callback=lambda processed, total, image_path: progress_events.append(
+            (processed, total, image_path.name)
+        ),
+    )
+
+    assert document["summary"] == {"total_files": 0, "processed": 0, "failed": 0}
+    assert progress_events == []

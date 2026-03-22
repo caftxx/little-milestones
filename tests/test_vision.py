@@ -57,13 +57,13 @@ def test_vision_client_uses_json_schema_when_supported(monkeypatch, tmp_path: Pa
                                 "content": "",
                                 "reasoning_content": json_dumps(
                                     {
-                                        "summary": "calm baby photo",
+                                        "summary": "安静的宝宝照片",
                                         "baby_present": True,
-                                        "actions": ["lying down"],
-                                        "expressions": ["calm"],
-                                        "scene": "bedroom",
-                                        "objects": ["rattle"],
-                                        "highlights": ["good grip"],
+                                        "actions": ["平躺"],
+                                        "expressions": ["平静"],
+                                        "scene": "卧室",
+                                        "objects": ["摇铃"],
+                                        "highlights": ["抓握较稳"],
                                         "uncertainty": None,
                                     }
                                 ),
@@ -78,8 +78,16 @@ def test_vision_client_uses_json_schema_when_supported(monkeypatch, tmp_path: Pa
     client = OpenAIVisionClient("http://example.test/v1", "test-key", "vision-model")
     description = asyncio.run(client.describe(image_path, PhotoMetadata()))
 
-    assert description.summary == "calm baby photo"
+    assert description.summary == "安静的宝宝照片"
     assert len(calls) == 1
+    system_message = calls[0]["messages"][0]["content"]
+    user_message = calls[0]["messages"][1]["content"][0]["text"]
+    assert isinstance(system_message, str)
+    assert isinstance(user_message, str)
+    assert "只返回 JSON" in system_message
+    assert "所有字符串 value 都必须使用简体中文" in system_message
+    assert "key 必须保持以上英文" in system_message
+    assert "已知元信息如下" in user_message
     assert calls[0]["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -153,14 +161,14 @@ def test_vision_client_falls_back_to_text_when_schema_is_rejected(monkeypatch, t
                                 "content": "```json\n"
                                 + json_dumps(
                                     {
-                                        "summary": "baby holding toy",
+                                        "summary": "宝宝拿着玩具",
                                         "baby_present": True,
-                                        "actions": ["holding toy"],
-                                        "expressions": ["focused"],
-                                        "scene": "bedroom",
-                                        "objects": ["toy"],
-                                        "highlights": ["assisted play"],
-                                        "uncertainty": "age unclear",
+                                        "actions": ["抓着玩具"],
+                                        "expressions": ["专注"],
+                                        "scene": "卧室",
+                                        "objects": ["玩具"],
+                                        "highlights": ["在辅助下玩耍"],
+                                        "uncertainty": "年龄不够明确",
                                     }
                                 )
                                 + "\n```"
@@ -175,10 +183,32 @@ def test_vision_client_falls_back_to_text_when_schema_is_rejected(monkeypatch, t
     client = OpenAIVisionClient("http://example.test/v1", "test-key", "vision-model")
     description = asyncio.run(client.describe(image_path, PhotoMetadata()))
 
-    assert description.summary == "baby holding toy"
+    assert description.summary == "宝宝拿着玩具"
     assert len(calls) == 2
     assert calls[0]["response_format"]["type"] == "json_schema"
     assert calls[1]["response_format"] == {"type": "text"}
+
+
+def test_parse_description_accepts_chinese_values() -> None:
+    description = _parse_description(
+        json_dumps(
+            {
+                "summary": "宝宝趴着看向前方",
+                "baby_present": True,
+                "actions": ["趴卧", "抬头"],
+                "expressions": ["专注"],
+                "scene": "客厅地垫",
+                "objects": ["地垫", "玩具"],
+                "highlights": ["抬头更稳了"],
+                "uncertainty": "拍摄时间无法确认",
+            }
+        )
+    )
+
+    assert description.summary == "宝宝趴着看向前方"
+    assert description.actions == ["趴卧", "抬头"]
+    assert description.scene == "客厅地垫"
+    assert description.uncertainty == "拍摄时间无法确认"
 
 
 def test_balanced_client_uses_lowest_inflight_and_provider_capacity(monkeypatch, tmp_path: Path) -> None:

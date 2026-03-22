@@ -112,12 +112,15 @@ def test_report_payload_uses_parent_to_baby_warm_voice() -> None:
     assert "少用抽象赞美词和空泛抒情" in system_message
     assert "禁止出现“这个月想对你说……”" in system_message
     assert "不要出现“根据素材”" in system_message
+    assert "不要夹带英文标题、英文小结、英文解释、字段翻译" in system_message
     assert "读起来像月末写下的成长观察，不像总结报告" in user_message
     assert "正文前半段自然使用 1 次即可" in user_message
     assert "后文避免反复重复姓名" in user_message
     assert "少用“很美好”“很治愈”“特别珍贵”这类抽象评价" in user_message
     assert "不要直接对宝宝说话" in user_message
     assert "不要硬凑 milestone" in user_message
+    assert "只把素材里的事实转写成中文正文" in user_message
+    assert "不要插入英文说明或字段翻译" in user_message
 
 
 def test_generate_report_files_writes_markdown_and_debug_json(monkeypatch, tmp_path: Path) -> None:

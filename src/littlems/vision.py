@@ -286,10 +286,14 @@ def _build_payload(
             {
                 "role": "system",
                 "content": (
-                    "You describe baby photos for later monthly reports. "
-                    "Return JSON only with keys: summary, baby_present, actions, "
-                    "expressions, scene, objects, highlights, uncertainty. "
-                    "Do not invent time, location, or device details."
+                    "你负责为宝宝照片生成后续月报可用的结构化描述。"
+                    "只返回 JSON，不要输出代码块、解释、前后缀说明或额外文本。"
+                    "JSON 对象只能包含这些固定 key：summary、baby_present、actions、"
+                    "expressions、scene、objects、highlights、uncertainty。"
+                    "key 必须保持以上英文，不要翻译、改名或新增字段。"
+                    "除布尔值和 null 外，JSON 中所有字符串 value 都必须使用简体中文。"
+                    "数组中的字符串元素也必须是简体中文。"
+                    "不要编造素材里没有的时间、地点、设备细节或其他无法确认的信息。"
                 ),
             },
             {
@@ -298,7 +302,7 @@ def _build_payload(
                     {
                         "type": "text",
                         "text": (
-                            "Known metadata:\n"
+                            "已知元信息如下，请结合图片理解，但不要超出事实推断：\n"
                             f"{json.dumps(prepared_input.metadata_payload, ensure_ascii=False)}"
                         ),
                     },

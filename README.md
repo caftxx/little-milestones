@@ -129,6 +129,39 @@ uv run littlems validate-config --provider-config ./providers.json
 uv run littlems validate-config --provider-config ./providers.json --probe
 ```
 
+把解析结果同步到 Immich 的资产描述：
+
+```bash
+export IMMICH_API_KEY=your-immich-api-key
+
+uv run littlems sync-immich update-asset-description \
+  --input ./descriptions.json \
+  --immich-url http://immich.lan/api
+```
+
+把月报 Markdown 写入 Immich 相册描述：
+
+```bash
+export IMMICH_API_KEY=your-immich-api-key
+
+uv run littlems sync-immich update-album-description \
+  --report ./report.md \
+  --month 2026-03 \
+  --immich-url http://immich.lan/api \
+  --album-prefix 宝宝成长
+```
+
+如果想先看匹配和更新计划、不真正写入 Immich，可以加上 `--dry-run`：
+
+```bash
+export IMMICH_API_KEY=your-immich-api-key
+
+uv run littlems sync-immich update-asset-description \
+  --input ./descriptions.json \
+  --immich-url http://immich.lan/api \
+  --dry-run
+```
+
 带 `--probe` 时，终端会按 provider 输出 `OK` 或 `FAIL` 摘要，便于快速定位是哪台机器或哪个模型配置有问题。
 失败摘要会额外给出一个简短的 `kind` 分类，例如 `timeout`、`unauthorized`、`not_found`、`rate_limited`。
 
@@ -138,6 +171,21 @@ uv run littlems validate-config --provider-config ./providers.json --probe
 - `--provider-config`：provider 配置文件路径，必填
 - `--log-path`：覆盖日志文件输出路径
 - `--log-level`：设置日志级别，排查问题时可用 `DEBUG`
+
+`sync-immich` 常用参数：
+
+- `update-asset-description --output`：结果 JSON 输出路径，默认生成 `<input>.immich-update-asset-description.json`
+- `update-asset-description --match-window-minutes`：按文件名与拍摄时间搜索 Immich 资产时允许的分钟偏差，默认 `5`
+- `update-asset-description --include-videos`：不跳过非图片记录；默认会跳过当前未支持的非图片条目
+- `update-album-description --album-prefix`：相册名前缀，例如 `宝宝成长`
+- `update-album-description --output`：结果 JSON 输出路径，默认生成 `<report>.immich-update-album-description.json`
+- `--dry-run`：只读取 Immich 元数据并输出计划结果，不发送写请求
+
+`sync-immich` 会：
+
+- `update-asset-description`：读取 `descriptions.json` 里的 `records`，优先用 `originalFileName` + `takenAfter/takenBefore` 搜索 Immich 资产；如果 `captured_at` 不可靠或时间窗无命中，则回退到文件名候选，并用路径后缀与弱时间比较做唯一化，再覆盖写入 asset `description`
+- `update-album-description`：读取月报 Markdown，用 `GET /albums` 按 `YYYY-MM` 或 `<prefix> YYYY-MM` 查找现有相册，再更新 album `description`
+- 两个子命令都会输出一份同步结果 JSON，包含更新成功、未匹配或失败统计
 
 如果未提供 `--provider-config`，CLI 会直接报错。
 

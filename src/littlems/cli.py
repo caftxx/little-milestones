@@ -9,6 +9,12 @@ from pathlib import Path
 import httpx
 
 from littlems.config import ProviderPoolSettings, ProviderSettings, load_provider_settings
+from littlems.immich import (
+    default_album_sync_output_path,
+    default_asset_sync_output_path,
+    sync_album_description_to_immich,
+    sync_asset_descriptions_to_immich,
+)
 from littlems.report import generate_report_files
 from littlems.service import PhotoDescriptionService
 from littlems.vision import BalancedVisionClient
@@ -111,6 +117,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logging verbosity for debugging",
     )
     generate_report.add_argument(
+        "--log-path",
+        type=Path,
+        help="Log file output path; defaults to ./log/littlems.log",
+    )
+
+    sync_immich = subparsers.add_parser("sync-immich", help="Sync descriptions and reports into Immich metadata")
+    sync_subparsers = sync_immich.add_subparsers(dest="sync_command", required=True)
+
+    update_asset_description = sync_subparsers.add_parser(
+        "update-asset-description",
+        help="Update Immich asset descriptions from descriptions JSON",
+    )
+    update_asset_description.add_argument("--input", required=True, type=Path, help="Describe output JSON file path")
+    update_asset_description.add_argument("--immich-url", required=True, help="Immich API base URL, for example http://immich.lan/api")
+    update_asset_description.add_argument(
+        "--output",
+        type=Path,
+        help="Sync result JSON file path; defaults to <input>.immich-update-asset-description.json",
+    )
+    update_asset_description.add_argument(
+        "--match-window-minutes",
+        type=_positive_int,
+        default=5,
+        help="Allowed capture-time difference when matching assets (default: 5)",
+    )
+    update_asset_description.add_argument(
+        "--skip-videos",
+        action="store_true",
+        default=True,
+        help="Skip unsupported non-image records (default: enabled)",
+    )
+    update_asset_description.add_argument(
+        "--include-videos",
+        action="store_false",
+        dest="skip_videos",
+        help="Do not skip unsupported non-image records",
+    )
+    update_asset_description.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Read Immich metadata and write the sync report without mutating Immich",
+    )
+    update_asset_description.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Logging verbosity for debugging",
+    )
+    update_asset_description.add_argument(
+        "--log-path",
+        type=Path,
+        help="Log file output path; defaults to ./log/littlems.log",
+    )
+
+    update_album_description = sync_subparsers.add_parser(
+        "update-album-description",
+        help="Update an Immich album description from a monthly report Markdown file",
+    )
+    update_album_description.add_argument("--report", required=True, type=Path, help="Monthly report Markdown file path")
+    update_album_description.add_argument("--month", required=True, help="Target month in YYYY-MM format")
+    update_album_description.add_argument("--immich-url", required=True, help="Immich API base URL, for example http://immich.lan/api")
+    update_album_description.add_argument(
+        "--album-prefix",
+        default="",
+        help="Optional prefix added before the YYYY-MM album name",
+    )
+    update_album_description.add_argument(
+        "--output",
+        type=Path,
+        help="Sync result JSON file path; defaults to <report>.immich-update-album-description.json",
+    )
+    update_album_description.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Read Immich metadata and write the sync report without mutating Immich",
+    )
+    update_album_description.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Logging verbosity for debugging",
+    )
+    update_album_description.add_argument(
         "--log-path",
         type=Path,
         help="Log file output path; defaults to ./log/littlems.log",
@@ -227,6 +316,74 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         logger.info("generate-report command finished output=%s", args.output)
+        return 0
+    if args.command == "sync-immich" and args.sync_command == "update-asset-description":
+        api_key = os.getenv("IMMICH_API_KEY", "").strip()
+        if not api_key:
+            raise SystemExit("IMMICH_API_KEY environment variable is required for sync-immich")
+        output_path = args.output if args.output is not None else default_asset_sync_output_path(args.input)
+        logger.info(
+            "starting sync-immich update-asset-description input=%s immich_url=%s output=%s dry_run=%s",
+            args.input,
+            args.immich_url,
+            output_path,
+            args.dry_run,
+        )
+        result = asyncio.run(
+            sync_asset_descriptions_to_immich(
+                input_path=args.input,
+                immich_url=args.immich_url,
+                api_key=api_key,
+                output_path=output_path,
+                match_window_minutes=args.match_window_minutes,
+                skip_videos=args.skip_videos,
+                dry_run=args.dry_run,
+            )
+        )
+        summary = result["summary"]
+        print(
+            "Immich asset sync complete: "
+            f"matched={summary['matched']} "
+            f"updated={summary['updated']} "
+            f"unmatched={summary['unmatched']} "
+            f"ambiguous={summary['ambiguous']} "
+            f"output={output_path}"
+        )
+        logger.info("sync-immich update-asset-description finished output=%s summary=%s", output_path, summary)
+        return 0
+    if args.command == "sync-immich" and args.sync_command == "update-album-description":
+        api_key = os.getenv("IMMICH_API_KEY", "").strip()
+        if not api_key:
+            raise SystemExit("IMMICH_API_KEY environment variable is required for sync-immich")
+        output_path = args.output if args.output is not None else default_album_sync_output_path(args.report)
+        logger.info(
+            "starting sync-immich update-album-description report=%s month=%s immich_url=%s output=%s dry_run=%s",
+            args.report,
+            args.month,
+            args.immich_url,
+            output_path,
+            args.dry_run,
+        )
+        result = asyncio.run(
+            sync_album_description_to_immich(
+                report_path=args.report,
+                month=args.month,
+                immich_url=args.immich_url,
+                api_key=api_key,
+                album_prefix=args.album_prefix,
+                output_path=output_path,
+                dry_run=args.dry_run,
+            )
+        )
+        summary = result["summary"]
+        print(
+            "Immich album sync complete: "
+            f"updated={summary['updated']} "
+            f"missing_album={summary['missing_album']} "
+            f"update_failed={summary['update_failed']} "
+            f"output={output_path}"
+        )
+        logger.info("sync-immich update-album-description finished output=%s summary=%s", output_path, summary)
         return 0
     parser.error(f"Unsupported command: {args.command}")
     return 2

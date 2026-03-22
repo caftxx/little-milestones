@@ -9,6 +9,7 @@ from pathlib import Path
 
 from littlems.cli import build_service, main
 from littlems.config import ProviderPoolSettings, ProviderSettings
+from littlems.immich import default_album_sync_output_path, default_asset_sync_output_path
 from littlems.service import ResumeState
 
 
@@ -601,6 +602,252 @@ def test_generate_report_requires_baby_name(tmp_path: Path) -> None:
         assert exc.code == 2
     else:
         raise AssertionError("Expected generate-report to require --baby-name")
+
+
+def test_cli_runs_sync_immich_update_asset_description_command(monkeypatch, tmp_path: Path, capsys) -> None:
+    input_path = tmp_path / "descriptions.json"
+    output_path = tmp_path / "sync.json"
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
+
+    captured: dict[str, object] = {}
+
+    async def fake_sync_asset_descriptions_to_immich(
+        *,
+        input_path: Path,
+        immich_url: str,
+        api_key: str,
+        output_path: Path | None = None,
+        match_window_minutes: int = 5,
+        skip_videos: bool = True,
+        dry_run: bool = False,
+        client_transport: object = None,
+    ) -> dict[str, object]:
+        del client_transport
+        captured.update(
+            {
+                "input_path": input_path,
+                "immich_url": immich_url,
+                "api_key": api_key,
+                "output_path": output_path,
+                "match_window_minutes": match_window_minutes,
+                "skip_videos": skip_videos,
+                "dry_run": dry_run,
+            }
+        )
+        return {
+            "summary": {
+                "matched": 2,
+                "updated": 2,
+                "unmatched": 1,
+                "ambiguous": 0,
+            }
+        }
+
+    monkeypatch.setattr("littlems.cli.sync_asset_descriptions_to_immich", fake_sync_asset_descriptions_to_immich)
+
+    exit_code = main(
+        [
+            "sync-immich",
+            "update-asset-description",
+            "--input",
+            str(input_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--output",
+            str(output_path),
+            "--match-window-minutes",
+            "9",
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "input_path": input_path,
+        "immich_url": "http://immich.lan/api",
+        "api_key": "secret-key",
+        "output_path": output_path,
+        "match_window_minutes": 9,
+        "skip_videos": True,
+        "dry_run": True,
+    }
+    assert "Immich asset sync complete: matched=2 updated=2 unmatched=1 ambiguous=0 output=" in capsys.readouterr().out
+
+
+def test_sync_immich_requires_api_key_env(tmp_path: Path) -> None:
+    input_path = tmp_path / "descriptions.json"
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        main(
+            [
+                "sync-immich",
+                "update-asset-description",
+                "--input",
+                str(input_path),
+                "--immich-url",
+                "http://immich.lan/api",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == "IMMICH_API_KEY environment variable is required for sync-immich"
+    else:
+        raise AssertionError("Expected sync-immich update-asset-description to require IMMICH_API_KEY")
+
+
+def test_sync_immich_requires_subcommand() -> None:
+    try:
+        main(["sync-immich"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected sync-immich to require a subcommand")
+
+
+def test_sync_immich_update_asset_description_uses_default_output_path(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "descriptions.json"
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
+
+    captured: dict[str, object] = {}
+
+    async def fake_sync_asset_descriptions_to_immich(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "summary": {
+                "matched": 0,
+                "updated": 0,
+                "unmatched": 0,
+                "ambiguous": 0,
+            }
+        }
+
+    monkeypatch.setattr("littlems.cli.sync_asset_descriptions_to_immich", fake_sync_asset_descriptions_to_immich)
+
+    exit_code = main(
+        [
+            "sync-immich",
+            "update-asset-description",
+            "--input",
+            str(input_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--include-videos",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["output_path"] == default_asset_sync_output_path(input_path)
+    assert captured["skip_videos"] is False
+
+
+def test_cli_runs_sync_immich_update_album_description_command(monkeypatch, tmp_path: Path, capsys) -> None:
+    report_path = tmp_path / "report.md"
+    output_path = tmp_path / "album-sync.json"
+    report_path.write_text("# report\n", encoding="utf-8")
+    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
+
+    captured: dict[str, object] = {}
+
+    async def fake_sync_album_description_to_immich(
+        *,
+        report_path: Path,
+        month: str,
+        immich_url: str,
+        api_key: str,
+        album_prefix: str = "",
+        output_path: Path | None = None,
+        dry_run: bool = False,
+        client_transport: object = None,
+    ) -> dict[str, object]:
+        del client_transport
+        captured.update(
+            {
+                "report_path": report_path,
+                "month": month,
+                "immich_url": immich_url,
+                "api_key": api_key,
+                "album_prefix": album_prefix,
+                "output_path": output_path,
+                "dry_run": dry_run,
+            }
+        )
+        return {
+            "summary": {
+                "updated": 1,
+                "missing_album": 0,
+                "update_failed": 0,
+            }
+        }
+
+    monkeypatch.setattr("littlems.cli.sync_album_description_to_immich", fake_sync_album_description_to_immich)
+
+    exit_code = main(
+        [
+            "sync-immich",
+            "update-album-description",
+            "--report",
+            str(report_path),
+            "--month",
+            "2026-03",
+            "--immich-url",
+            "http://immich.lan/api",
+            "--album-prefix",
+            "宝宝成长",
+            "--output",
+            str(output_path),
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "report_path": report_path,
+        "month": "2026-03",
+        "immich_url": "http://immich.lan/api",
+        "api_key": "secret-key",
+        "album_prefix": "宝宝成长",
+        "output_path": output_path,
+        "dry_run": True,
+    }
+    assert "Immich album sync complete: updated=1 missing_album=0 update_failed=0 output=" in capsys.readouterr().out
+
+
+def test_sync_immich_update_album_description_uses_default_output_path(monkeypatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "report.md"
+    report_path.write_text("# report\n", encoding="utf-8")
+    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
+
+    captured: dict[str, object] = {}
+
+    async def fake_sync_album_description_to_immich(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "summary": {
+                "updated": 0,
+                "missing_album": 1,
+                "update_failed": 0,
+            }
+        }
+
+    monkeypatch.setattr("littlems.cli.sync_album_description_to_immich", fake_sync_album_description_to_immich)
+
+    exit_code = main(
+        [
+            "sync-immich",
+            "update-album-description",
+            "--report",
+            str(report_path),
+            "--month",
+            "2026-03",
+            "--immich-url",
+            "http://immich.lan/api",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["output_path"] == default_album_sync_output_path(report_path)
 
 
 def test_probe_provider_pool_runs_concurrently() -> None:

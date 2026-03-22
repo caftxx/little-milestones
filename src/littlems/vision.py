@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -27,56 +28,62 @@ class OpenAIVisionClient:
         self._model = model
         self._timeout = timeout
 
-    def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription:
+    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription:
         logger.debug("building vision request image=%s model=%s", image_path, self._model)
-        schema_payload = _build_payload(
+        schema_payload = await asyncio.to_thread(
+            _build_payload,
             image_path=image_path,
             metadata=metadata,
             model=self._model,
             response_format=_json_schema_response_format(),
         )
 
-        try:
-            return self._send_and_parse(
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            try:
+                return await self._send_and_parse(
+                    client=client,
+                    image_path=image_path,
+                    payload=schema_payload,
+                    format_name="json_schema",
+                )
+            except httpx.HTTPStatusError as exc:
+                if not _should_fallback_to_text(exc.response):
+                    raise RuntimeError(f"Vision model request failed: {exc}") from exc
+                logger.warning(
+                    "vision request rejected structured format image=%s status=%s body=%s",
+                    image_path,
+                    exc.response.status_code,
+                    _response_text_excerpt(exc.response),
+                )
+                logger.info("falling back from json_schema to text image=%s", image_path)
+
+            text_payload = await asyncio.to_thread(
+                _build_payload,
                 image_path=image_path,
-                payload=schema_payload,
-                format_name="json_schema",
+                metadata=metadata,
+                model=self._model,
+                response_format={"type": "text"},
             )
-        except httpx.HTTPStatusError as exc:
-            if not _should_fallback_to_text(exc.response):
+            try:
+                return await self._send_and_parse(
+                    client=client,
+                    image_path=image_path,
+                    payload=text_payload,
+                    format_name="text",
+                )
+            except Exception as exc:  # pragma: no cover - exercised through integration
                 raise RuntimeError(f"Vision model request failed: {exc}") from exc
-            logger.warning(
-                "vision request rejected structured format image=%s status=%s body=%s",
-                image_path,
-                exc.response.status_code,
-                _response_text_excerpt(exc.response),
-            )
-            logger.info("falling back from json_schema to text image=%s", image_path)
 
-        text_payload = _build_payload(
-            image_path=image_path,
-            metadata=metadata,
-            model=self._model,
-            response_format={"type": "text"},
-        )
-        try:
-            return self._send_and_parse(
-                image_path=image_path,
-                payload=text_payload,
-                format_name="text",
-            )
-        except Exception as exc:  # pragma: no cover - exercised through integration
-            raise RuntimeError(f"Vision model request failed: {exc}") from exc
-
-    def _send_and_parse(
+    async def _send_and_parse(
         self,
         *,
+        client: httpx.AsyncClient,
         image_path: Path,
         payload: dict[str, object],
         format_name: str,
     ) -> VisionDescription:
         logger.info("sending vision request image=%s format=%s", image_path, format_name)
-        response = httpx.post(
+        response = await client.post(
             f"{self._base_url}/chat/completions",
             headers={
                 "Authorization": f"Bearer {self._api_key}",

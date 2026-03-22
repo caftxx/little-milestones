@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -21,40 +22,57 @@ def test_vision_client_uses_json_schema_when_supported(monkeypatch, tmp_path: Pa
     image_path = _create_sample_image(tmp_path)
     calls: list[dict[str, object]] = []
 
-    def fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: float) -> httpx.Response:
-        del headers, timeout
-        calls.append(json)
-        request = httpx.Request("POST", url)
-        return httpx.Response(
-            200,
-            request=request,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": "",
-                            "reasoning_content": json_dumps(
-                                {
-                                    "summary": "calm baby photo",
-                                    "baby_present": True,
-                                    "actions": ["lying down"],
-                                    "expressions": ["calm"],
-                                    "scene": "bedroom",
-                                    "objects": ["rattle"],
-                                    "highlights": ["good grip"],
-                                    "uncertainty": None,
-                                }
-                            )
-                        }
-                    }
-                ]
-            },
-        )
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
 
-    monkeypatch.setattr("littlems.vision.httpx.post", fake_post)
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, object],
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            del headers, timeout
+            calls.append(json)
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": json_dumps(
+                                    {
+                                        "summary": "calm baby photo",
+                                        "baby_present": True,
+                                        "actions": ["lying down"],
+                                        "expressions": ["calm"],
+                                        "scene": "bedroom",
+                                        "objects": ["rattle"],
+                                        "highlights": ["good grip"],
+                                        "uncertainty": None,
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("littlems.vision.httpx.AsyncClient", FakeAsyncClient)
 
     client = OpenAIVisionClient("http://example.test/v1", "test-key", "vision-model")
-    description = client.describe(image_path, PhotoMetadata())
+    description = asyncio.run(client.describe(image_path, PhotoMetadata()))
 
     assert description.summary == "calm baby photo"
     assert len(calls) == 1
@@ -94,47 +112,64 @@ def test_vision_client_falls_back_to_text_when_schema_is_rejected(monkeypatch, t
     image_path = _create_sample_image(tmp_path)
     calls: list[dict[str, object]] = []
 
-    def fake_post(url: str, *, headers: dict[str, str], json: dict[str, object], timeout: float) -> httpx.Response:
-        del headers, timeout
-        calls.append(json)
-        request = httpx.Request("POST", url)
-        if len(calls) == 1:
-            return httpx.Response(
-                400,
-                request=request,
-                text='{"error":"\'response_format.type\' must be \'json_schema\' or \'text\'"}',
-            )
-        return httpx.Response(
-            200,
-            request=request,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": "```json\n"
-                            + json_dumps(
-                                {
-                                    "summary": "baby holding toy",
-                                    "baby_present": True,
-                                    "actions": ["holding toy"],
-                                    "expressions": ["focused"],
-                                    "scene": "bedroom",
-                                    "objects": ["toy"],
-                                    "highlights": ["assisted play"],
-                                    "uncertainty": "age unclear",
-                                }
-                            )
-                            + "\n```"
-                        }
-                    }
-                ]
-            },
-        )
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
 
-    monkeypatch.setattr("littlems.vision.httpx.post", fake_post)
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, object],
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            del headers, timeout
+            calls.append(json)
+            request = httpx.Request("POST", url)
+            if len(calls) == 1:
+                return httpx.Response(
+                    400,
+                    request=request,
+                    text='{"error":"\'response_format.type\' must be \'json_schema\' or \'text\'"}',
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "```json\n"
+                                + json_dumps(
+                                    {
+                                        "summary": "baby holding toy",
+                                        "baby_present": True,
+                                        "actions": ["holding toy"],
+                                        "expressions": ["focused"],
+                                        "scene": "bedroom",
+                                        "objects": ["toy"],
+                                        "highlights": ["assisted play"],
+                                        "uncertainty": "age unclear",
+                                    }
+                                )
+                                + "\n```"
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr("littlems.vision.httpx.AsyncClient", FakeAsyncClient)
 
     client = OpenAIVisionClient("http://example.test/v1", "test-key", "vision-model")
-    description = client.describe(image_path, PhotoMetadata())
+    description = asyncio.run(client.describe(image_path, PhotoMetadata()))
 
     assert description.summary == "baby holding toy"
     assert len(calls) == 2

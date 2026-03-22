@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class VisionClient(Protocol):
-    def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription: ...
+    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription: ...
 
 
 class ProgressCallback(Protocol):
@@ -32,39 +33,40 @@ class PhotoDescriptionService:
         self._model_name = model_name
         self._base_url = base_url
 
-    def describe_directory(
+    async def describe_directory(
         self,
         input_dir: Path,
         recursive: bool = False,
+        parallelism: int = 4,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, object]:
         logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
         paths = scan_photo_paths(input_dir, recursive=recursive)
-        logger.info("found %s supported image files", len(paths))
-        records: list[dict[str, object]] = []
-        failures: list[dict[str, str]] = []
+        logger.info("found %s supported image files parallelism=%s", len(paths), parallelism)
         total = len(paths)
+        records_by_index: dict[int, dict[str, object]] = {}
+        failures_by_index: dict[int, dict[str, str]] = {}
 
-        for processed, image_path in enumerate(paths, start=1):
-            logger.info("processing image=%s", image_path)
-            try:
-                metadata = extract_photo_metadata(image_path)
-                logger.debug("metadata extracted image=%s metadata_source=%s", image_path, metadata.metadata_source)
-                description = self._vision_client.describe(image_path, metadata)
-                logger.debug("vision description complete image=%s summary=%s", image_path, description.summary)
-                records.append(_build_record(image_path, metadata, description))
-            except Exception as exc:
-                logger.exception("failed to process image=%s", image_path)
-                failures.append(
-                    {
-                        "file_name": image_path.name,
-                        "file_path": str(image_path.resolve()),
-                        "error": str(exc),
-                    }
-                )
-            finally:
+        if total:
+            semaphore = asyncio.Semaphore(parallelism)
+            tasks = [
+                asyncio.create_task(self._describe_one(index, image_path, semaphore))
+                for index, image_path in enumerate(paths)
+            ]
+
+            processed = 0
+            for task in asyncio.as_completed(tasks):
+                index, image_path, record, failure = await task
+                processed += 1
+                if record is not None:
+                    records_by_index[index] = record
+                if failure is not None:
+                    failures_by_index[index] = failure
                 if progress_callback is not None:
                     progress_callback(processed, total, image_path)
+
+        records = [records_by_index[index] for index in range(total) if index in records_by_index]
+        failures = [failures_by_index[index] for index in range(total) if index in failures_by_index]
 
         document = {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -93,16 +95,18 @@ class PhotoDescriptionService:
         )
         return document
 
-    def describe_to_file(
+    async def describe_to_file(
         self,
         input_dir: Path,
         output_file: Path,
         recursive: bool = False,
+        parallelism: int = 4,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
-        document = self.describe_directory(
+        document = await self.describe_directory(
             input_dir,
             recursive=recursive,
+            parallelism=parallelism,
             progress_callback=progress_callback,
         )
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +116,28 @@ class PhotoDescriptionService:
             encoding="utf-8",
         )
         logger.debug("output json written bytes=%s", output_file.stat().st_size)
+
+    async def _describe_one(
+        self,
+        index: int,
+        image_path: Path,
+        semaphore: asyncio.Semaphore,
+    ) -> tuple[int, Path, dict[str, object] | None, dict[str, str] | None]:
+        async with semaphore:
+            logger.info("processing image=%s", image_path)
+            try:
+                metadata = await asyncio.to_thread(extract_photo_metadata, image_path)
+                logger.debug("metadata extracted image=%s metadata_source=%s", image_path, metadata.metadata_source)
+                description = await self._vision_client.describe(image_path, metadata)
+                logger.debug("vision description complete image=%s summary=%s", image_path, description.summary)
+                return index, image_path, _build_record(image_path, metadata, description), None
+            except Exception as exc:
+                logger.exception("failed to process image=%s", image_path)
+                return index, image_path, None, {
+                    "file_name": image_path.name,
+                    "file_path": str(image_path.resolve()),
+                    "error": str(exc),
+                }
 
 
 def _build_record(

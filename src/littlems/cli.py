@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import argparse
 import logging
 import os
@@ -61,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Log file output path; defaults to ./log/littlems.log",
     )
+    describe.add_argument(
+        "--parallelism",
+        type=_positive_int,
+        default=4,
+        help="Maximum number of in-flight image processing tasks; defaults to 4",
+    )
     return parser
 
 
@@ -86,16 +93,19 @@ def main(argv: list[str] | None = None) -> int:
             unit="image",
             dynamic_ncols=True,
         ) as progress:
-            service.describe_to_file(
-                args.input,
-                args.output,
-                recursive=args.recursive,
-                progress_callback=lambda processed, total, image_path: _update_progress(
-                    progress,
-                    processed,
-                    total,
-                    image_path,
-                ),
+            asyncio.run(
+                service.describe_to_file(
+                    args.input,
+                    args.output,
+                    recursive=args.recursive,
+                    parallelism=args.parallelism,
+                    progress_callback=lambda processed, total, image_path: _update_progress(
+                        progress,
+                        processed,
+                        total,
+                        image_path,
+                    ),
+                )
             )
         logger.info("describe command finished output=%s", args.output)
         return 0
@@ -135,6 +145,13 @@ def _clean_base_url(value: str | None) -> str | None:
     return text or None
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def _resolve_log_path(args: argparse.Namespace) -> Path:
     if args.log_path is not None:
         return args.log_path
@@ -156,7 +173,6 @@ def _configure_logging(level_name: str, log_path: Path) -> None:
 def _update_progress(progress: tqdm, processed: int, total: int, image_path: Path) -> None:
     if progress.total != total:
         progress.total = total
-    progress.set_postfix_str(image_path.name)
     progress.update(processed - progress.n)
 
 

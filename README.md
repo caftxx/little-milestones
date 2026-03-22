@@ -77,6 +77,7 @@ uv run littlems describe \
 - `--openai-base-url`：覆盖 `OPENAI_BASE_URL`
 - `--openai-api-key`：覆盖 `OPENAI_API_KEY`
 - `--vision-model`：覆盖 `VISION_MODEL`
+- `--parallelism`：设置并发提交的图片任务数，默认 `4`
 - `--log-path`：覆盖日志文件输出路径
 - `--log-level`：设置日志级别，排查问题时可用 `DEBUG`
 
@@ -90,8 +91,11 @@ uv run littlems describe \
 uv run littlems describe \
   --input ./photos \
   --output ./descriptions.json \
+  --parallelism 8 \
   --log-level DEBUG
 ```
+
+`--parallelism` 控制客户端同时在途的图片任务数；实际吞吐还会受到本地模型服务端并发能力和硬件资源影响。
 
 如果你想自定义日志文件位置，可以显式传入：
 

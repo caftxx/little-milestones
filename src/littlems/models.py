@@ -33,6 +33,18 @@ class VisionProvider:
 
 
 @dataclass(slots=True)
+class VisionProviderAttempt:
+    provider_name: str
+    elapsed_ms: int
+    ok: bool
+    error: str | None = None
+    started_at_monotonic_ns: int | None = None
+    finished_at_monotonic_ns: int | None = None
+
+
+@dataclass(slots=True)
 class VisionResult:
     provider: VisionProvider
     description: VisionDescription
+    provider_elapsed_ms: int
+    provider_attempts: list[VisionProviderAttempt]

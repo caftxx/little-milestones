@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,13 @@ import httpx
 from PIL import Image, ImageOps
 
 from littlems.config import ProviderSettings
-from littlems.models import PhotoMetadata, VisionDescription, VisionProvider, VisionResult
+from littlems.models import (
+    PhotoMetadata,
+    VisionDescription,
+    VisionProvider,
+    VisionProviderAttempt,
+    VisionResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +123,24 @@ class _ProviderRuntime:
     inflight: int = 0
 
 
+class VisionProviderFailure(RuntimeError):
+    def __init__(
+        self,
+        image_name: str,
+        provider_attempts: list[VisionProviderAttempt],
+    ) -> None:
+        self.image_name = image_name
+        self.provider_attempts = provider_attempts
+        self.last_provider_name = provider_attempts[-1].provider_name if provider_attempts else None
+        self.provider_elapsed_ms = sum(attempt.elapsed_ms for attempt in provider_attempts)
+        joined_errors = "; ".join(
+            f"{attempt.provider_name}: {attempt.error}"
+            for attempt in provider_attempts
+            if attempt.error
+        )
+        super().__init__(f"All providers failed for {image_name}: {joined_errors}")
+
+
 class BalancedVisionClient:
     def __init__(self, providers: list[ProviderSettings]) -> None:
         if not providers:
@@ -136,12 +161,23 @@ class BalancedVisionClient:
 
     async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionResult:
         attempted: set[int] = set()
-        errors: list[str] = []
+        provider_attempts: list[VisionProviderAttempt] = []
 
         while len(attempted) < len(self._providers):
             index, runtime = await self._acquire_provider(excluded=attempted)
+            started_ns = time.perf_counter_ns()
             try:
                 description = await runtime.client.describe(image_path, metadata)
+                finished_ns = time.perf_counter_ns()
+                elapsed_ms = _elapsed_ms_between(started_ns, finished_ns)
+                attempt = VisionProviderAttempt(
+                    provider_name=runtime.settings.name,
+                    elapsed_ms=elapsed_ms,
+                    ok=True,
+                    started_at_monotonic_ns=started_ns,
+                    finished_at_monotonic_ns=finished_ns,
+                )
+                provider_attempts.append(attempt)
                 return VisionResult(
                     provider=VisionProvider(
                         name=runtime.settings.name,
@@ -149,10 +185,23 @@ class BalancedVisionClient:
                         model=runtime.settings.vision_model,
                     ),
                     description=description,
+                    provider_elapsed_ms=sum(item.elapsed_ms for item in provider_attempts),
+                    provider_attempts=provider_attempts,
                 )
             except Exception as exc:
+                finished_ns = time.perf_counter_ns()
+                elapsed_ms = _elapsed_ms_between(started_ns, finished_ns)
                 attempted.add(index)
-                errors.append(f"{runtime.settings.name}: {exc}")
+                provider_attempts.append(
+                    VisionProviderAttempt(
+                        provider_name=runtime.settings.name,
+                        elapsed_ms=elapsed_ms,
+                        ok=False,
+                        error=str(exc),
+                        started_at_monotonic_ns=started_ns,
+                        finished_at_monotonic_ns=finished_ns,
+                    )
+                )
                 logger.warning(
                     "provider failed image=%s provider=%s error=%s",
                     image_path,
@@ -162,8 +211,7 @@ class BalancedVisionClient:
             finally:
                 await self._release_provider(index)
 
-        joined_errors = "; ".join(errors)
-        raise RuntimeError(f"All providers failed for {image_path.name}: {joined_errors}")
+        raise VisionProviderFailure(image_path.name, provider_attempts)
 
     async def _acquire_provider(self, *, excluded: set[int]) -> tuple[int, _ProviderRuntime]:
         async with self._condition:
@@ -196,6 +244,10 @@ class BalancedVisionClient:
                 runtime.settings.max_inflight,
             )
             self._condition.notify_all()
+
+
+def _elapsed_ms_between(started_ns: int, finished_ns: int) -> int:
+    return max(0, round((finished_ns - started_ns) / 1_000_000))
 
 
 def _build_payload(

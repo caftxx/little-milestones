@@ -3,15 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 from littlems.exif import extract_photo_metadata
-from littlems.models import PhotoMetadata, VisionResult
+from littlems.models import PhotoMetadata, VisionProviderAttempt, VisionResult
 from littlems.scanner import scan_photo_paths
+from littlems.vision import VisionProviderFailure
 
 logger = logging.getLogger(__name__)
+
+
+ProviderStats = dict[str, int]
 
 
 class VisionClient(Protocol):
@@ -37,16 +42,14 @@ class PhotoDescriptionService:
         recursive: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, object]:
+        started_ns = time.perf_counter_ns()
         logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
         paths = scan_photo_paths(input_dir, recursive=recursive)
         logger.info("found %s supported image files", len(paths))
         total = len(paths)
         records_by_index: dict[int, dict[str, object]] = {}
-        failures_by_index: dict[int, dict[str, str]] = {}
-        provider_stats = {
-            name: {"processed": 0, "failed": 0}
-            for name in self._provider_names
-        }
+        failures_by_index: dict[int, dict[str, object]] = {}
+        provider_stats = {name: _new_provider_stats() for name in self._provider_names}
 
         if total:
             tasks = [
@@ -56,24 +59,27 @@ class PhotoDescriptionService:
 
             processed = 0
             for task in asyncio.as_completed(tasks):
-                index, image_path, record, failure = await task
+                index, image_path, record, failure, provider_attempts = await task
                 processed += 1
+                _accumulate_provider_attempts(provider_stats, provider_attempts)
                 if record is not None:
                     records_by_index[index] = record
                     provider_name = str(record["provider_name"])
-                    provider_stats.setdefault(provider_name, {"processed": 0, "failed": 0})
+                    provider_stats.setdefault(provider_name, _new_provider_stats())
                     provider_stats[provider_name]["processed"] += 1
                 if failure is not None:
                     failures_by_index[index] = failure
                     provider_name = failure.get("provider_name")
                     if provider_name:
-                        provider_stats.setdefault(provider_name, {"processed": 0, "failed": 0})
+                        provider_stats.setdefault(provider_name, _new_provider_stats())
                         provider_stats[provider_name]["failed"] += 1
                 if progress_callback is not None:
                     progress_callback(processed, total, image_path)
 
         records = [records_by_index[index] for index in range(total) if index in records_by_index]
         failures = [failures_by_index[index] for index in range(total) if index in failures_by_index]
+        _finalize_provider_stats(provider_stats)
+        total_wall_clock_ms = _elapsed_ms_between(started_ns, time.perf_counter_ns())
 
         document = {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -90,6 +96,7 @@ class PhotoDescriptionService:
                 "total_files": len(paths),
                 "processed": len(records),
                 "failed": len(failures),
+                "wall_clock_ms": total_wall_clock_ms,
             },
             "records": records,
             "failures": failures,
@@ -126,23 +133,40 @@ class PhotoDescriptionService:
         self,
         index: int,
         image_path: Path,
-    ) -> tuple[int, Path, dict[str, object] | None, dict[str, str] | None]:
+    ) -> tuple[
+        int,
+        Path,
+        dict[str, object] | None,
+        dict[str, object] | None,
+        list[VisionProviderAttempt],
+    ]:
         logger.info("processing image=%s", image_path)
         try:
             metadata = await asyncio.to_thread(extract_photo_metadata, image_path)
             logger.debug("metadata extracted image=%s metadata_source=%s", image_path, metadata.metadata_source)
             result = await self._vision_client.describe(image_path, metadata)
             logger.debug("vision description complete image=%s summary=%s", image_path, result.description.summary)
-            return index, image_path, _build_record(image_path, metadata, result), None
-        except Exception as exc:
+            return index, image_path, _build_record(image_path, metadata, result), None, result.provider_attempts
+        except VisionProviderFailure as exc:
             logger.exception("failed to process image=%s", image_path)
-            provider_name = _extract_failed_provider_name(str(exc))
             return index, image_path, None, {
                 "file_name": image_path.name,
                 "file_path": str(image_path.resolve()),
                 "error": str(exc),
-                "provider_name": provider_name,
-            }
+                "provider_name": exc.last_provider_name,
+                "provider_elapsed_ms": exc.provider_elapsed_ms,
+                "provider_attempts": _serialize_provider_attempts(exc.provider_attempts),
+            }, exc.provider_attempts
+        except Exception as exc:
+            logger.exception("failed to process image=%s", image_path)
+            return index, image_path, None, {
+                "file_name": image_path.name,
+                "file_path": str(image_path.resolve()),
+                "error": str(exc),
+                "provider_name": None,
+                "provider_elapsed_ms": 0,
+                "provider_attempts": [],
+            }, []
 
 
 def _build_record(
@@ -171,16 +195,71 @@ def _build_record(
         "provider_name": result.provider.name,
         "provider_base_url": result.provider.base_url,
         "provider_model": result.provider.model,
+        "provider_elapsed_ms": result.provider_elapsed_ms,
+        "provider_attempts": _serialize_provider_attempts(result.provider_attempts),
     }
 
 
-def _extract_failed_provider_name(error_text: str) -> str | None:
-    prefix = "All providers failed for "
-    if prefix not in error_text:
-        return None
-    _, _, details = error_text.partition(": ")
-    if not details:
-        return None
-    first_entry, _, _ = details.partition("; ")
-    provider_name, _, _ = first_entry.partition(": ")
-    return provider_name or None
+def _serialize_provider_attempts(attempts: list[VisionProviderAttempt]) -> list[dict[str, object]]:
+    return [
+        {
+            "provider_name": attempt.provider_name,
+            "elapsed_ms": attempt.elapsed_ms,
+            "ok": attempt.ok,
+            "error": attempt.error,
+        }
+        for attempt in attempts
+    ]
+
+
+def _accumulate_provider_attempts(
+    provider_stats: dict[str, ProviderStats],
+    attempts: list[VisionProviderAttempt],
+) -> None:
+    for attempt in attempts:
+        provider_name = attempt.provider_name
+        stats = provider_stats.setdefault(provider_name, _new_provider_stats())
+        started_ns = attempt.started_at_monotonic_ns
+        finished_ns = attempt.finished_at_monotonic_ns
+        if started_ns is None or finished_ns is None:
+            continue
+        stats["_attempt_count"] += 1
+        stats["_attempt_wall_clock_ms_total"] += _elapsed_ms_between(started_ns, finished_ns)
+        if stats["_first_started_ns"] < 0 or started_ns < stats["_first_started_ns"]:
+            stats["_first_started_ns"] = started_ns
+        if finished_ns > stats["_last_finished_ns"]:
+            stats["_last_finished_ns"] = finished_ns
+
+
+def _finalize_provider_stats(provider_stats: dict[str, ProviderStats]) -> None:
+    for stats in provider_stats.values():
+        attempt_count = int(stats.pop("_attempt_count", 0))
+        attempt_wall_clock_ms_total = int(stats.pop("_attempt_wall_clock_ms_total", 0))
+        first_started_ns = int(stats.pop("_first_started_ns", -1))
+        last_finished_ns = int(stats.pop("_last_finished_ns", -1))
+        stats["wall_clock_ms"] = (
+            _elapsed_ms_between(first_started_ns, last_finished_ns)
+            if first_started_ns >= 0 and last_finished_ns >= 0
+            else 0
+        )
+        if attempt_count:
+            stats["wall_clock_ms_avg"] = round(attempt_wall_clock_ms_total / attempt_count)
+        else:
+            stats["wall_clock_ms_avg"] = 0
+
+
+def _new_provider_stats() -> ProviderStats:
+    return {
+        "processed": 0,
+        "failed": 0,
+        "wall_clock_ms": 0,
+        "wall_clock_ms_avg": 0,
+        "_attempt_count": 0,
+        "_attempt_wall_clock_ms_total": 0,
+        "_first_started_ns": -1,
+        "_last_finished_ns": -1,
+    }
+
+
+def _elapsed_ms_between(started_ns: int, finished_ns: int) -> int:
+    return max(0, round((finished_ns - started_ns) / 1_000_000))

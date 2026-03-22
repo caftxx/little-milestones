@@ -161,12 +161,31 @@ uv run littlems describe \
 - `provider_name`
 - `provider_base_url`
 - `provider_model`
+- `provider_elapsed_ms`
 
 其中：
 
 - `gps` 优先来自 EXIF
 - 如果 EXIF 不包含 GPS，则使用默认值 `30.346701,120.002066`
 - `metadata_source` 会标记字段来源，例如 `exif`、`default_gps`
+- `provider_elapsed_ms` 表示这张图片在 provider 处理阶段累计消耗的毫秒数
+  它是单图片的 provider attempt 累计值，不等于整次任务或某个 provider 的墙钟时间
+
+顶层 `provider_stats` 中还会额外包含：
+
+- `wall_clock_ms`
+- `wall_clock_ms_avg`
+
+它们分别表示：
+
+- `wall_clock_ms`: 每个 provider 从第一条 attempt 开始到最后一条 attempt 结束的占用窗口，单位毫秒
+- `wall_clock_ms_avg`: 每个 provider 各次 attempt 的单次墙钟耗时平均值，单位毫秒
+
+顶层 `summary` 中还包含：
+
+- `wall_clock_ms`
+
+它表示本次 `describe_directory()` 从开始扫描到生成结果文档的整次墙钟耗时，单位毫秒。
 
 ## 测试
 

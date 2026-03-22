@@ -214,6 +214,8 @@ def test_balanced_client_uses_lowest_inflight_and_provider_capacity(monkeypatch,
     assert seen.count("slow") == 1
     assert seen.count("fast") == 2
     assert active == {"slow": 0, "fast": 0}
+    assert all(result.provider_elapsed_ms > 0 for result in results)
+    assert all(len(result.provider_attempts) == 1 for result in results)
 
 
 def test_balanced_client_retries_with_other_provider_on_failure(monkeypatch, tmp_path: Path) -> None:
@@ -241,6 +243,9 @@ def test_balanced_client_retries_with_other_provider_on_failure(monkeypatch, tmp
     assert attempted == ["first", "second"]
     assert result.provider.name == "second"
     assert result.provider.model == "model-second"
+    assert result.provider_elapsed_ms >= 0
+    assert [attempt.provider_name for attempt in result.provider_attempts] == ["first", "second"]
+    assert [attempt.ok for attempt in result.provider_attempts] == [False, True]
 
 
 def test_balanced_client_raises_when_all_providers_fail(monkeypatch, tmp_path: Path) -> None:
@@ -258,8 +263,32 @@ def test_balanced_client_raises_when_all_providers_fail(monkeypatch, tmp_path: P
         ]
     )
 
-    with pytest.raises(RuntimeError, match="All providers failed"):
+    with pytest.raises(RuntimeError, match="All providers failed") as exc_info:
         asyncio.run(client.describe(image_path, PhotoMetadata()))
+    failure = exc_info.value
+    assert getattr(failure, "provider_elapsed_ms") >= 0
+    assert [attempt.provider_name for attempt in getattr(failure, "provider_attempts")] == ["first", "second"]
+
+
+def test_balanced_client_reports_integer_elapsed_ms(monkeypatch, tmp_path: Path) -> None:
+    image_path = _create_sample_image(tmp_path)
+
+    async def fake_describe(self: OpenAIVisionClient, image_path: Path, metadata: PhotoMetadata) -> object:
+        await asyncio.sleep(0.01)
+        return _make_description("ok")
+
+    monkeypatch.setattr("littlems.vision.OpenAIVisionClient.describe", fake_describe)
+
+    client = BalancedVisionClient(
+        [
+            ProviderSettings("only", "http://example.test/only/v1", "key", "model-only"),
+        ]
+    )
+
+    result = asyncio.run(client.describe(image_path, PhotoMetadata()))
+
+    assert isinstance(result.provider_elapsed_ms, int)
+    assert isinstance(result.provider_attempts[0].elapsed_ms, int)
 
 
 def test_parse_description_fails_for_non_json_response() -> None:

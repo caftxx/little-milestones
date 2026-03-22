@@ -46,7 +46,7 @@ Little Milestones v1 的目标，就是把这条链路先跑通：
 uv sync --extra dev
 ```
 
-先准备一个 provider 配置文件。仓库里已经提供了示例 [`providers.example.json`](/mnt/c/Users/caft/Desktop/code/little-milestones/providers.example.json)，可以直接复制一份改成自己的配置。
+先准备一个 provider 配置文件。仓库里已经提供了示例 [`providers.example.json`](providers.example.json)，可以直接复制一份改成自己的配置。
 
 示例内容如下：
 

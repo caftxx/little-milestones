@@ -97,12 +97,31 @@ def main(argv: list[str] | None = None) -> int:
             [provider.name for provider in settings.providers],
         )
         service = build_service(settings)
+        resume_state = None
+        inspect_resume = getattr(service, "inspect_resume_state", None)
+        if callable(inspect_resume):
+            resume_state = inspect_resume(
+                args.input,
+                args.output,
+                recursive=args.recursive,
+            )
+            logger.info(
+                "describe resume summary total=%s skipped=%s failed_to_retry=%s pending=%s",
+                resume_state.total_files,
+                resume_state.skipped,
+                resume_state.failed_to_retry,
+                resume_state.pending,
+            )
         with tqdm(
-            total=0,
+            total=resume_state.total_files if resume_state is not None else 0,
             desc="Processing photos",
             unit="image",
             dynamic_ncols=True,
         ) as progress:
+            if resume_state is not None and resume_state.skipped:
+                progress.n = resume_state.skipped
+                if hasattr(progress, "refresh"):
+                    progress.refresh()
             asyncio.run(
                 service.describe_to_file(
                     args.input,

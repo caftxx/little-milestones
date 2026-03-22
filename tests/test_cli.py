@@ -9,6 +9,7 @@ from pathlib import Path
 
 from littlems.cli import main
 from littlems.config import ProviderPoolSettings, ProviderSettings
+from littlems.service import ResumeState
 
 
 def test_cli_runs_describe_command(monkeypatch, tmp_path: Path) -> None:
@@ -161,6 +162,79 @@ def test_cli_log_path_overrides_default(monkeypatch, tmp_path: Path) -> None:
     assert exit_code == 0
     assert log_path.exists()
     assert not (tmp_path / "log" / "littlems.log").exists()
+
+
+def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    output_path = tmp_path / "descriptions.json"
+    config_path = _write_provider_config(tmp_path)
+
+    observed: dict[str, object] = {}
+
+    class StubProgressBar:
+        def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
+            self.total = total
+            self.desc = desc
+            self.unit = unit
+            self.dynamic_ncols = dynamic_ncols
+            self.n = 0
+            self.refreshed = False
+
+        def __enter__(self) -> StubProgressBar:
+            observed["progress"] = self
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def refresh(self) -> None:
+            self.refreshed = True
+
+        def set_postfix_str(self, value: str) -> None:
+            return None
+
+        def update(self, delta: int) -> None:
+            self.n += delta
+
+    class StubService:
+        def inspect_resume_state(self, input_dir: Path, output_file: Path, recursive: bool = False) -> ResumeState:
+            observed["inspect"] = (input_dir, output_file, recursive)
+            return ResumeState(total_files=8, skipped=3, failed_to_retry=2, pending=5)
+
+        async def describe_to_file(
+            self,
+            input_dir: Path,
+            output_file: Path,
+            recursive: bool,
+            progress_callback: object = None,
+        ) -> None:
+            observed["describe"] = (input_dir, output_file, recursive)
+            if progress_callback is not None:
+                progress_callback(4, 8, photos / "d.jpg")
+
+    monkeypatch.setattr("littlems.cli.build_service", lambda settings: StubService())
+    monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
+
+    exit_code = main(
+        [
+            "describe",
+            "--input",
+            str(photos),
+            "--output",
+            str(output_path),
+            "--provider-config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 0
+    progress = observed["progress"]
+    assert isinstance(progress, StubProgressBar)
+    assert progress.total == 8
+    assert progress.refreshed is True
+    assert progress.n == 4
 
 
 def test_cli_requires_provider_config(tmp_path: Path) -> None:

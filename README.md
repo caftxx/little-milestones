@@ -119,6 +119,12 @@ uv run littlems validate-config --provider-config ./providers.json --probe
 
 默认情况下，日志会写入当前工作目录下的 `log/littlems.log`，不会打印到终端；终端只显示处理进度条。
 
+`describe` 命令会把结果增量写入 `--output` 指定的 JSON 文件。也就是说，处理过程中这个文件始终保持可读取状态；如果 CLI 因异常、手动中断或机器重启而提前退出，下一次用同一个 `--output` 重新执行时，会自动读取已有结果并恢复任务：
+
+- 已成功写入 `records` 的文件会直接跳过
+- 已写入 `failures` 的文件会重新尝试处理
+- 输出文件的输入目录、递归参数或 provider 列表不一致时，会拒绝恢复，避免混写到同一个结果文件
+
 调试时可以这样运行：
 
 ```bash
@@ -145,13 +151,17 @@ uv run littlems describe \
 
 输出 JSON 顶层包含：
 
+- 输出格式版本
+- 任务状态
 - 任务生成时间
+- 最近一次更新时间
 - 输入目录
 - 模型信息
 - provider 使用统计
-- 总文件数、成功数、失败数
+- 总文件数、成功数、失败数、跳过数、剩余数
 - `records`
 - `failures`
+- `run_state`
 
 每条照片记录至少包含这些字段：
 
@@ -200,8 +210,25 @@ uv run littlems describe \
 顶层 `summary` 中还包含：
 
 - `wall_clock_ms`
+- `skipped`
+- `remaining`
 
 它表示本次 `describe_directory()` 从开始扫描到生成结果文档的整次墙钟耗时，单位毫秒。
+
+其中：
+
+- `skipped`：恢复执行时直接复用、未重新处理的成功文件数
+- `remaining`：当前输出文件快照里仍未成功也未失败落盘的文件数；任务完成后会变为 `0`
+
+顶层还新增了：
+
+- `version`: 当前输出格式版本，现为 `2`
+- `status`: `running` 或 `completed`
+- `updated_at`: 当前文件最近一次写盘时间
+- `run_state.completed_files`: 已成功文件的绝对路径，用于断点续跑时跳过
+- `run_state.failed_files`: 当前仍处于失败状态的文件绝对路径
+
+出于恢复能力考虑，程序会在处理过程中反复重写整个 JSON 文件，但采用同目录临时文件加原子替换的方式，避免半写坏正式输出文件。
 
 ## 测试
 

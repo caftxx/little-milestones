@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from littlems.exif import extract_photo_metadata
 from littlems.models import PhotoMetadata, VisionProviderAttempt, VisionResult
@@ -16,7 +18,41 @@ from littlems.vision import VisionProviderFailure
 logger = logging.getLogger(__name__)
 
 
+OUTPUT_VERSION = 2
 ProviderStats = dict[str, int]
+
+
+@dataclass(slots=True)
+class ResumeState:
+    total_files: int
+    skipped: int
+    failed_to_retry: int
+    pending: int
+
+
+@dataclass(slots=True)
+class ProviderMetricTotals:
+    attempt_count: int = 0
+    attempt_wall_clock_ms_total: int = 0
+    wall_clock_ms_total: int = 0
+
+
+@dataclass(slots=True)
+class _RunState:
+    input_dir: Path
+    recursive: bool
+    paths: list[Path]
+    output_file: Path | None
+    generated_at: str
+    skipped_count: int
+    prior_wall_clock_ms: int
+    current_run_started_ns: int
+    records_by_path: dict[str, dict[str, object]]
+    failures_by_path: dict[str, dict[str, object]]
+    completed_files: set[str]
+    failed_files: set[str]
+    provider_metrics_base: dict[str, ProviderMetricTotals]
+    current_provider_windows: dict[str, ProviderStats]
 
 
 class VisionClient(Protocol):
@@ -36,76 +72,48 @@ class PhotoDescriptionService:
         self._vision_client = vision_client
         self._provider_names = provider_names
 
+    def inspect_resume_state(
+        self,
+        input_dir: Path,
+        output_file: Path,
+        recursive: bool = False,
+    ) -> ResumeState:
+        paths = scan_photo_paths(input_dir, recursive=recursive)
+        state = self._prepare_run_state(
+            input_dir=input_dir,
+            paths=paths,
+            recursive=recursive,
+            output_file=output_file,
+        )
+        return ResumeState(
+            total_files=len(paths),
+            skipped=state.skipped_count,
+            failed_to_retry=len(state.failed_files),
+            pending=self._pending_count(state),
+        )
+
     async def describe_directory(
         self,
         input_dir: Path,
         recursive: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, object]:
-        started_ns = time.perf_counter_ns()
         logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
         paths = scan_photo_paths(input_dir, recursive=recursive)
         logger.info("found %s supported image files", len(paths))
-        total = len(paths)
-        records_by_index: dict[int, dict[str, object]] = {}
-        failures_by_index: dict[int, dict[str, object]] = {}
-        provider_stats = {name: _new_provider_stats() for name in self._provider_names}
-
-        if total:
-            tasks = [
-                asyncio.create_task(self._describe_one(index, image_path))
-                for index, image_path in enumerate(paths)
-            ]
-
-            processed = 0
-            for task in asyncio.as_completed(tasks):
-                index, image_path, record, failure, provider_attempts = await task
-                processed += 1
-                _accumulate_provider_attempts(provider_stats, provider_attempts)
-                if record is not None:
-                    records_by_index[index] = record
-                    provider_name = str(record["provider_name"])
-                    provider_stats.setdefault(provider_name, _new_provider_stats())
-                    provider_stats[provider_name]["processed"] += 1
-                if failure is not None:
-                    failures_by_index[index] = failure
-                    provider_name = failure.get("provider_name")
-                    if provider_name:
-                        provider_stats.setdefault(provider_name, _new_provider_stats())
-                        provider_stats[provider_name]["failed"] += 1
-                if progress_callback is not None:
-                    progress_callback(processed, total, image_path)
-
-        records = [records_by_index[index] for index in range(total) if index in records_by_index]
-        failures = [failures_by_index[index] for index in range(total) if index in failures_by_index]
-        _finalize_provider_stats(provider_stats)
-        total_wall_clock_ms = _elapsed_ms_between(started_ns, time.perf_counter_ns())
-
-        document = {
-            "generated_at": datetime.now(UTC).isoformat(),
-            "input": {
-                "directory": str(input_dir.resolve()),
-                "recursive": recursive,
-            },
-            "model": {
-                "provider": "multi_provider_pool",
-                "providers": self._provider_names,
-            },
-            "provider_stats": provider_stats,
-            "summary": {
-                "total_files": len(paths),
-                "processed": len(records),
-                "failed": len(failures),
-                "wall_clock_ms": total_wall_clock_ms,
-            },
-            "records": records,
-            "failures": failures,
-        }
+        state = self._prepare_run_state(
+            input_dir=input_dir,
+            paths=paths,
+            recursive=recursive,
+            output_file=None,
+        )
+        await self._process_pending_paths(state, progress_callback=progress_callback)
+        document = self._build_document(state, status="completed")
         logger.info(
             "describe_directory finished total=%s processed=%s failed=%s",
             len(paths),
-            len(records),
-            len(failures),
+            len(document["records"]),
+            len(document["failures"]),
         )
         return document
 
@@ -116,18 +124,308 @@ class PhotoDescriptionService:
         recursive: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
-        document = await self.describe_directory(
-            input_dir,
+        logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
+        paths = scan_photo_paths(input_dir, recursive=recursive)
+        logger.info("found %s supported image files", len(paths))
+        state = self._prepare_run_state(
+            input_dir=input_dir,
+            paths=paths,
             recursive=recursive,
-            progress_callback=progress_callback,
+            output_file=output_file,
         )
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "resume state total=%s skipped=%s failed_to_retry=%s pending=%s",
+            len(paths),
+            state.skipped_count,
+            len(state.failed_files),
+            self._pending_count(state),
+        )
+        self._write_document(state, status="running")
+        await self._process_pending_paths(state, progress_callback=progress_callback)
+        self._write_document(state, status="completed")
         logger.info("writing output json=%s", output_file)
-        output_file.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+
+    async def _process_pending_paths(
+        self,
+        state: _RunState,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        pending_paths = [path for path in state.paths if str(path.resolve()) not in state.completed_files]
+        total = len(state.paths)
+        if not pending_paths:
+            return
+
+        tasks = [
+            asyncio.create_task(self._describe_one(index, image_path))
+            for index, image_path in enumerate(pending_paths)
+        ]
+
+        processed = 0
+        for task in asyncio.as_completed(tasks):
+            _, image_path, record, failure, provider_attempts = await task
+            processed += 1
+            _accumulate_provider_attempts(state.current_provider_windows, provider_attempts)
+            self._merge_result_into_state(state, image_path, record=record, failure=failure)
+            if state.output_file is not None:
+                self._write_document(state, status="running")
+            if progress_callback is not None:
+                progress_callback(state.skipped_count + processed, total, image_path)
+
+    def _prepare_run_state(
+        self,
+        input_dir: Path,
+        paths: list[Path],
+        recursive: bool,
+        output_file: Path | None,
+    ) -> _RunState:
+        generated_at = datetime.now(UTC).isoformat()
+        records_by_path: dict[str, dict[str, object]] = {}
+        failures_by_path: dict[str, dict[str, object]] = {}
+        completed_files: set[str] = set()
+        failed_files: set[str] = set()
+        provider_metrics_base = {name: ProviderMetricTotals() for name in self._provider_names}
+        prior_wall_clock_ms = 0
+
+        if output_file is not None and output_file.exists():
+            payload = self._load_existing_output(output_file)
+            self._validate_resume_payload(payload, input_dir=input_dir, recursive=recursive)
+            generated_at = str(payload["generated_at"])
+            prior_wall_clock_ms = int(_int_from_mapping(payload.get("summary"), "wall_clock_ms"))
+            records_by_path = _records_by_path(payload.get("records"))
+            failures_by_path = _records_by_path(payload.get("failures"))
+            run_state = _mapping(payload.get("run_state"), "run_state")
+            completed_files = {str(item) for item in _list_of_strings(run_state.get("completed_files"), "run_state.completed_files")}
+            failed_files = {str(item) for item in _list_of_strings(run_state.get("failed_files"), "run_state.failed_files")}
+            completed_files |= set(records_by_path)
+            failed_files |= set(failures_by_path)
+            provider_metrics_base = self._load_provider_metrics(payload)
+
+        valid_paths = {str(path.resolve()) for path in paths}
+        records_by_path = {path: record for path, record in records_by_path.items() if path in valid_paths}
+        failures_by_path = {path: failure for path, failure in failures_by_path.items() if path in valid_paths}
+        completed_files &= valid_paths
+        failed_files &= valid_paths
+        failed_files -= completed_files
+
+        return _RunState(
+            input_dir=input_dir,
+            recursive=recursive,
+            paths=paths,
+            output_file=output_file,
+            generated_at=generated_at,
+            skipped_count=len(completed_files),
+            prior_wall_clock_ms=prior_wall_clock_ms,
+            current_run_started_ns=time.perf_counter_ns(),
+            records_by_path=records_by_path,
+            failures_by_path=failures_by_path,
+            completed_files=completed_files,
+            failed_files=failed_files,
+            provider_metrics_base=provider_metrics_base,
+            current_provider_windows={name: _new_provider_stats() for name in self._provider_names},
         )
-        logger.debug("output json written bytes=%s", output_file.stat().st_size)
+
+    def _load_existing_output(self, output_file: Path) -> dict[str, object]:
+        try:
+            payload = json.loads(output_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Output file is not valid JSON: {output_file}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise SystemExit(f"Output file must contain a JSON object: {output_file}")
+        return payload
+
+    def _validate_resume_payload(
+        self,
+        payload: dict[str, object],
+        input_dir: Path,
+        recursive: bool,
+    ) -> None:
+        version = payload.get("version")
+        if version != OUTPUT_VERSION:
+            raise SystemExit(f"Output file version mismatch: expected {OUTPUT_VERSION}, got {version}")
+        input_payload = _mapping(payload.get("input"), "input")
+        expected_directory = str(input_dir.resolve())
+        actual_directory = str(input_payload.get("directory"))
+        if actual_directory != expected_directory:
+            raise SystemExit(
+                "Output file input directory does not match current run: "
+                f"{actual_directory} != {expected_directory}"
+            )
+        actual_recursive = bool(input_payload.get("recursive"))
+        if actual_recursive != recursive:
+            raise SystemExit(
+                "Output file recursive flag does not match current run: "
+                f"{actual_recursive} != {recursive}"
+            )
+        model_payload = _mapping(payload.get("model"), "model")
+        actual_providers = [str(item) for item in _list_of_strings(model_payload.get("providers"), "model.providers")]
+        if actual_providers != self._provider_names:
+            raise SystemExit(
+                "Output file providers do not match current run: "
+                f"{actual_providers} != {self._provider_names}"
+            )
+
+    def _load_provider_metrics(self, payload: dict[str, object]) -> dict[str, ProviderMetricTotals]:
+        metrics = {name: ProviderMetricTotals() for name in self._provider_names}
+        run_state = payload.get("run_state")
+        if isinstance(run_state, dict):
+            provider_metrics = run_state.get("provider_metrics")
+            if isinstance(provider_metrics, dict):
+                for name, raw in provider_metrics.items():
+                    if not isinstance(raw, dict):
+                        continue
+                    metrics[str(name)] = ProviderMetricTotals(
+                        attempt_count=_int_from_mapping(raw, "attempt_count"),
+                        attempt_wall_clock_ms_total=_int_from_mapping(raw, "attempt_wall_clock_ms_total"),
+                        wall_clock_ms_total=_int_from_mapping(raw, "wall_clock_ms_total"),
+                    )
+                return metrics
+
+        for record in payload.get("records", []):
+            if isinstance(record, dict):
+                _accumulate_provider_metric_totals(metrics, record)
+        for failure in payload.get("failures", []):
+            if isinstance(failure, dict):
+                _accumulate_provider_metric_totals(metrics, failure)
+        provider_stats = payload.get("provider_stats")
+        if isinstance(provider_stats, dict):
+            for name, raw in provider_stats.items():
+                if not isinstance(raw, dict):
+                    continue
+                metric = metrics.setdefault(str(name), ProviderMetricTotals())
+                metric.wall_clock_ms_total = _int_from_mapping(raw, "wall_clock_ms")
+        return metrics
+
+    def _merge_result_into_state(
+        self,
+        state: _RunState,
+        image_path: Path,
+        *,
+        record: dict[str, object] | None,
+        failure: dict[str, object] | None,
+    ) -> None:
+        file_path = str(image_path.resolve())
+        if record is not None:
+            state.records_by_path[file_path] = record
+            state.failures_by_path.pop(file_path, None)
+            state.completed_files.add(file_path)
+            state.failed_files.discard(file_path)
+        if failure is not None:
+            state.failures_by_path[file_path] = failure
+            state.records_by_path.pop(file_path, None)
+            state.completed_files.discard(file_path)
+            state.failed_files.add(file_path)
+
+    def _build_document(self, state: _RunState, status: str) -> dict[str, object]:
+        provider_stats, provider_metrics = self._build_provider_stats(state)
+        records = self._ordered_records(state.paths, state.records_by_path)
+        failures = self._ordered_records(state.paths, state.failures_by_path)
+        processed = len(records)
+        failed = len(failures)
+        total = len(state.paths)
+        current_wall_clock_ms = _elapsed_ms_between(state.current_run_started_ns, time.perf_counter_ns())
+
+        return {
+            "version": OUTPUT_VERSION,
+            "status": status,
+            "generated_at": state.generated_at,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "input": {
+                "directory": str(state.input_dir.resolve()),
+                "recursive": state.recursive,
+            },
+            "model": {
+                "provider": "multi_provider_pool",
+                "providers": self._provider_names,
+            },
+            "provider_stats": provider_stats,
+            "summary": {
+                "total_files": total,
+                "processed": processed,
+                "failed": failed,
+                "skipped": state.skipped_count,
+                "remaining": max(0, total - processed - failed),
+                "wall_clock_ms": state.prior_wall_clock_ms + current_wall_clock_ms,
+            },
+            "records": records,
+            "failures": failures,
+            "run_state": {
+                "completed_files": sorted(state.completed_files),
+                "failed_files": sorted(state.failed_files),
+                "provider_metrics": provider_metrics,
+            },
+        }
+
+    def _build_provider_stats(
+        self,
+        state: _RunState,
+    ) -> tuple[dict[str, ProviderStats], dict[str, dict[str, int]]]:
+        current_snapshots = _snapshot_provider_windows(state.current_provider_windows)
+        provider_names = set(self._provider_names)
+        provider_names |= set(state.provider_metrics_base)
+        provider_names |= set(current_snapshots)
+        provider_names |= {str(record.get("provider_name")) for record in state.records_by_path.values() if record.get("provider_name")}
+        provider_names |= {str(record.get("provider_name")) for record in state.failures_by_path.values() if record.get("provider_name")}
+
+        provider_stats: dict[str, ProviderStats] = {}
+        provider_metrics: dict[str, dict[str, int]] = {}
+        for provider_name in sorted(provider_names):
+            base = state.provider_metrics_base.get(provider_name, ProviderMetricTotals())
+            current = current_snapshots.get(provider_name, _empty_provider_window_snapshot())
+            attempt_count = base.attempt_count + int(current["attempt_count"])
+            attempt_wall_clock_ms_total = base.attempt_wall_clock_ms_total + int(current["attempt_wall_clock_ms_total"])
+            wall_clock_ms_total = base.wall_clock_ms_total + int(current["wall_clock_ms"])
+            provider_metrics[provider_name] = {
+                "attempt_count": attempt_count,
+                "attempt_wall_clock_ms_total": attempt_wall_clock_ms_total,
+                "wall_clock_ms_total": wall_clock_ms_total,
+            }
+            provider_stats[provider_name] = {
+                "processed": sum(
+                    1
+                    for record in state.records_by_path.values()
+                    if record.get("provider_name") == provider_name
+                ),
+                "failed": sum(
+                    1
+                    for failure in state.failures_by_path.values()
+                    if failure.get("provider_name") == provider_name
+                ),
+                "wall_clock_ms": wall_clock_ms_total,
+                "wall_clock_ms_avg": round(attempt_wall_clock_ms_total / attempt_count) if attempt_count else 0,
+            }
+        return provider_stats, provider_metrics
+
+    def _ordered_records(
+        self,
+        paths: list[Path],
+        records_by_path: dict[str, dict[str, object]],
+    ) -> list[dict[str, object]]:
+        ordered: list[dict[str, object]] = []
+        for path in paths:
+            resolved = str(path.resolve())
+            record = records_by_path.get(resolved)
+            if record is not None:
+                ordered.append(record)
+        return ordered
+
+    def _pending_count(self, state: _RunState) -> int:
+        return sum(1 for path in state.paths if str(path.resolve()) not in state.completed_files)
+
+    def _write_document(self, state: _RunState, status: str) -> None:
+        if state.output_file is None:
+            return
+        output_file = state.output_file
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        document = self._build_document(state, status=status)
+        temp_file = output_file.with_name(f"{output_file.name}.tmp")
+        payload = json.dumps(document, ensure_ascii=False, indent=2)
+        payload_size = len(payload.encode("utf-8"))
+        with temp_file.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_file.replace(output_file)
+        logger.debug("output json written bytes=%s path=%s", payload_size, output_file)
 
     async def _describe_one(
         self,
@@ -231,21 +529,31 @@ def _accumulate_provider_attempts(
             stats["_last_finished_ns"] = finished_ns
 
 
-def _finalize_provider_stats(provider_stats: dict[str, ProviderStats]) -> None:
-    for stats in provider_stats.values():
-        attempt_count = int(stats.pop("_attempt_count", 0))
-        attempt_wall_clock_ms_total = int(stats.pop("_attempt_wall_clock_ms_total", 0))
-        first_started_ns = int(stats.pop("_first_started_ns", -1))
-        last_finished_ns = int(stats.pop("_last_finished_ns", -1))
-        stats["wall_clock_ms"] = (
-            _elapsed_ms_between(first_started_ns, last_finished_ns)
-            if first_started_ns >= 0 and last_finished_ns >= 0
-            else 0
-        )
-        if attempt_count:
-            stats["wall_clock_ms_avg"] = round(attempt_wall_clock_ms_total / attempt_count)
-        else:
-            stats["wall_clock_ms_avg"] = 0
+def _snapshot_provider_windows(provider_stats: dict[str, ProviderStats]) -> dict[str, ProviderStats]:
+    snapshots: dict[str, ProviderStats] = {}
+    for name, stats in provider_stats.items():
+        attempt_count = int(stats.get("_attempt_count", 0))
+        attempt_wall_clock_ms_total = int(stats.get("_attempt_wall_clock_ms_total", 0))
+        first_started_ns = int(stats.get("_first_started_ns", -1))
+        last_finished_ns = int(stats.get("_last_finished_ns", -1))
+        snapshots[name] = {
+            "attempt_count": attempt_count,
+            "attempt_wall_clock_ms_total": attempt_wall_clock_ms_total,
+            "wall_clock_ms": (
+                _elapsed_ms_between(first_started_ns, last_finished_ns)
+                if first_started_ns >= 0 and last_finished_ns >= 0
+                else 0
+            ),
+        }
+    return snapshots
+
+
+def _empty_provider_window_snapshot() -> ProviderStats:
+    return {
+        "attempt_count": 0,
+        "attempt_wall_clock_ms_total": 0,
+        "wall_clock_ms": 0,
+    }
 
 
 def _new_provider_stats() -> ProviderStats:
@@ -263,3 +571,65 @@ def _new_provider_stats() -> ProviderStats:
 
 def _elapsed_ms_between(started_ns: int, finished_ns: int) -> int:
     return max(0, round((finished_ns - started_ns) / 1_000_000))
+
+
+def _mapping(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise SystemExit(f"Output file field must be an object: {name}")
+    return value
+
+
+def _list_of_strings(value: object, name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SystemExit(f"Output file field must be a string array: {name}")
+    return list(value)
+
+
+def _records_by_path(value: object) -> dict[str, dict[str, object]]:
+    if value is None:
+        return {}
+    if not isinstance(value, list):
+        raise SystemExit("Output file field must be an array: records/failures")
+    records: dict[str, dict[str, object]] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            raise SystemExit("Output file records and failures must contain objects")
+        file_path = item.get("file_path")
+        if not isinstance(file_path, str):
+            raise SystemExit("Output file records and failures must contain file_path")
+        records[file_path] = item
+    return records
+
+
+def _int_from_mapping(value: object, key: str) -> int:
+    if not isinstance(value, dict):
+        return 0
+    raw = value.get(key)
+    return int(raw) if isinstance(raw, int) else 0
+
+
+def _accumulate_provider_metric_totals(
+    metrics: dict[str, ProviderMetricTotals],
+    payload: dict[str, object],
+) -> None:
+    attempts = payload.get("provider_attempts")
+    if not isinstance(attempts, list):
+        return
+    window_by_provider: dict[str, list[int]] = {}
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        provider_name = attempt.get("provider_name")
+        elapsed_ms = attempt.get("elapsed_ms")
+        if not isinstance(provider_name, str) or not isinstance(elapsed_ms, int):
+            continue
+        metric = metrics.setdefault(provider_name, ProviderMetricTotals())
+        metric.attempt_count += 1
+        metric.attempt_wall_clock_ms_total += elapsed_ms
+        bounds = window_by_provider.setdefault(provider_name, [metric.wall_clock_ms_total, metric.wall_clock_ms_total])
+        bounds[1] += elapsed_ms
+    for provider_name, bounds in window_by_provider.items():
+        metric = metrics.setdefault(provider_name, ProviderMetricTotals())
+        metric.wall_clock_ms_total = max(metric.wall_clock_ms_total, bounds[1])

@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from littlems.models import VisionDescription, VisionProvider, VisionProviderAttempt, VisionResult
-from littlems.service import PhotoDescriptionService
+from littlems.service import OUTPUT_VERSION, PhotoDescriptionService
 from littlems.vision import VisionProviderFailure
 from littlems.models import PhotoMetadata
 
@@ -126,6 +126,8 @@ def test_service_can_write_json_output(tmp_path: Path) -> None:
     asyncio.run(service.describe_to_file(photos, output_path, recursive=False))
 
     written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["version"] == OUTPUT_VERSION
+    assert written["status"] == "completed"
     assert written["model"] == {
         "provider": "multi_provider_pool",
         "providers": ["provider-a"],
@@ -134,7 +136,11 @@ def test_service_can_write_json_output(tmp_path: Path) -> None:
         "provider-a": {"processed": 1, "failed": 0, "wall_clock_ms": 12, "wall_clock_ms_avg": 12},
     }
     assert written["summary"]["processed"] == 1
+    assert written["summary"]["skipped"] == 0
+    assert written["summary"]["remaining"] == 0
     assert isinstance(written["summary"]["wall_clock_ms"], int)
+    assert written["run_state"]["completed_files"] == [str((photos / "sample.jpg").resolve())]
+    assert written["run_state"]["failed_files"] == []
 
 
 def test_service_builds_stats_for_mixed_supported_formats(monkeypatch, tmp_path: Path) -> None:
@@ -502,3 +508,343 @@ def test_service_tracks_multiple_provider_windows_on_failure_retry(tmp_path: Pat
         "provider-a": {"processed": 0, "failed": 0, "wall_clock_ms": 9, "wall_clock_ms_avg": 9},
         "provider-b": {"processed": 1, "failed": 0, "wall_clock_ms": 11, "wall_clock_ms_avg": 11},
     }
+
+
+def test_service_writes_incremental_running_document(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.jpg", "b.jpg"):
+        Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
+    output_path = tmp_path / "descriptions.json"
+
+    class SlowVisionClient:
+        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+            await asyncio.sleep(0.01 if image_path.name == "a.jpg" else 0.02)
+            return VisionResult(
+                provider=VisionProvider(
+                    name="provider-a",
+                    base_url="http://example.test/v1",
+                    model="test-model",
+                ),
+                provider_elapsed_ms=5,
+                provider_attempts=[_attempt("provider-a", start_ms=0, end_ms=5, ok=True)],
+                description=VisionDescription(
+                    summary=image_path.name,
+                    baby_present=True,
+                    actions=[],
+                    expressions=[],
+                    scene="room",
+                    objects=[],
+                    highlights=[],
+                    uncertainty=None,
+                ),
+            )
+
+    service = PhotoDescriptionService(
+        vision_client=SlowVisionClient(),
+        provider_names=["provider-a"],
+    )
+
+    snapshots: list[dict[str, object]] = []
+
+    def progress_callback(processed: int, total: int, image_path: Path) -> None:
+        del processed, total, image_path
+        snapshots.append(json.loads(output_path.read_text(encoding="utf-8")))
+
+    asyncio.run(
+        service.describe_to_file(
+            photos,
+            output_path,
+            recursive=False,
+            progress_callback=progress_callback,
+        )
+    )
+
+    assert len(snapshots) == 2
+    assert snapshots[0]["status"] == "running"
+    assert snapshots[0]["summary"]["processed"] == 1
+    assert snapshots[0]["summary"]["remaining"] == 1
+    assert len(snapshots[0]["records"]) == 1
+    final_document = json.loads(output_path.read_text(encoding="utf-8"))
+    assert final_document["status"] == "completed"
+    assert final_document["summary"]["processed"] == 2
+    assert final_document["summary"]["remaining"] == 0
+
+
+def test_service_resumes_and_skips_completed_files(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
+    output_path = tmp_path / "descriptions.json"
+
+    calls: list[str] = []
+
+    class ResumeVisionClient:
+        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+            del metadata
+            calls.append(image_path.name)
+            return VisionResult(
+                provider=VisionProvider(
+                    name="provider-a",
+                    base_url="http://example.test/v1",
+                    model="test-model",
+                ),
+                provider_elapsed_ms=5,
+                provider_attempts=[_attempt("provider-a", start_ms=0, end_ms=5, ok=True)],
+                description=VisionDescription(
+                    summary=image_path.name,
+                    baby_present=True,
+                    actions=[],
+                    expressions=[],
+                    scene="room",
+                    objects=[],
+                    highlights=[],
+                    uncertainty=None,
+                ),
+            )
+
+    existing_record = {
+        "file_name": "a.jpg",
+        "file_path": str((photos / "a.jpg").resolve()),
+        "captured_at": None,
+        "timezone": None,
+        "location": None,
+        "gps": None,
+        "device": None,
+        "summary": "a.jpg",
+        "baby_present": True,
+        "actions": [],
+        "expressions": [],
+        "scene": "room",
+        "objects": [],
+        "highlights": [],
+        "uncertainty": None,
+        "metadata_source": {},
+        "provider_name": "provider-a",
+        "provider_base_url": "http://example.test/v1",
+        "provider_model": "test-model",
+        "provider_elapsed_ms": 5,
+        "provider_attempts": [{"provider_name": "provider-a", "elapsed_ms": 5, "ok": True, "error": None}],
+    }
+    output_path.write_text(
+        json.dumps(
+            {
+                "version": OUTPUT_VERSION,
+                "status": "running",
+                "generated_at": "2026-03-22T00:00:00+00:00",
+                "updated_at": "2026-03-22T00:00:00+00:00",
+                "input": {"directory": str(photos.resolve()), "recursive": False},
+                "model": {"provider": "multi_provider_pool", "providers": ["provider-a"]},
+                "provider_stats": {
+                    "provider-a": {"processed": 1, "failed": 0, "wall_clock_ms": 5, "wall_clock_ms_avg": 5}
+                },
+                "summary": {
+                    "total_files": 3,
+                    "processed": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                    "remaining": 2,
+                    "wall_clock_ms": 5,
+                },
+                "records": [existing_record],
+                "failures": [],
+                "run_state": {
+                    "completed_files": [str((photos / "a.jpg").resolve())],
+                    "failed_files": [],
+                    "provider_metrics": {
+                        "provider-a": {
+                            "attempt_count": 1,
+                            "attempt_wall_clock_ms_total": 5,
+                            "wall_clock_ms_total": 5,
+                        }
+                    },
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    service = PhotoDescriptionService(
+        vision_client=ResumeVisionClient(),
+        provider_names=["provider-a"],
+    )
+
+    resume_state = service.inspect_resume_state(photos, output_path, recursive=False)
+    assert resume_state.total_files == 3
+    assert resume_state.skipped == 1
+    assert resume_state.failed_to_retry == 0
+    assert resume_state.pending == 2
+
+    asyncio.run(service.describe_to_file(photos, output_path, recursive=False))
+
+    assert sorted(calls) == ["b.jpg", "c.jpg"]
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["summary"]["skipped"] == 1
+    assert [item["file_name"] for item in written["records"]] == ["a.jpg", "b.jpg", "c.jpg"]
+
+
+def test_service_retries_failures_and_replaces_them_with_success(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for name in ("a.jpg", "b.jpg"):
+        Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
+    output_path = tmp_path / "descriptions.json"
+
+    calls: list[str] = []
+
+    class RetryFailedVisionClient:
+        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+            del metadata
+            calls.append(image_path.name)
+            return VisionResult(
+                provider=VisionProvider(
+                    name="provider-a",
+                    base_url="http://example.test/v1",
+                    model="test-model",
+                ),
+                provider_elapsed_ms=7,
+                provider_attempts=[_attempt("provider-a", start_ms=0, end_ms=7, ok=True)],
+                description=VisionDescription(
+                    summary=image_path.name,
+                    baby_present=True,
+                    actions=[],
+                    expressions=[],
+                    scene="room",
+                    objects=[],
+                    highlights=[],
+                    uncertainty=None,
+                ),
+            )
+
+    output_path.write_text(
+        json.dumps(
+            {
+                "version": OUTPUT_VERSION,
+                "status": "completed",
+                "generated_at": "2026-03-22T00:00:00+00:00",
+                "updated_at": "2026-03-22T00:00:00+00:00",
+                "input": {"directory": str(photos.resolve()), "recursive": False},
+                "model": {"provider": "multi_provider_pool", "providers": ["provider-a"]},
+                "provider_stats": {
+                    "provider-a": {"processed": 1, "failed": 1, "wall_clock_ms": 12, "wall_clock_ms_avg": 6}
+                },
+                "summary": {
+                    "total_files": 2,
+                    "processed": 1,
+                    "failed": 1,
+                    "skipped": 0,
+                    "remaining": 0,
+                    "wall_clock_ms": 12,
+                },
+                "records": [
+                    {
+                        "file_name": "a.jpg",
+                        "file_path": str((photos / "a.jpg").resolve()),
+                        "captured_at": None,
+                        "timezone": None,
+                        "location": None,
+                        "gps": None,
+                        "device": None,
+                        "summary": "a.jpg",
+                        "baby_present": True,
+                        "actions": [],
+                        "expressions": [],
+                        "scene": "room",
+                        "objects": [],
+                        "highlights": [],
+                        "uncertainty": None,
+                        "metadata_source": {},
+                        "provider_name": "provider-a",
+                        "provider_base_url": "http://example.test/v1",
+                        "provider_model": "test-model",
+                        "provider_elapsed_ms": 5,
+                        "provider_attempts": [{"provider_name": "provider-a", "elapsed_ms": 5, "ok": True, "error": None}],
+                    }
+                ],
+                "failures": [
+                    {
+                        "file_name": "b.jpg",
+                        "file_path": str((photos / "b.jpg").resolve()),
+                        "error": "boom",
+                        "provider_name": "provider-a",
+                        "provider_elapsed_ms": 7,
+                        "provider_attempts": [{"provider_name": "provider-a", "elapsed_ms": 7, "ok": False, "error": "boom"}],
+                    }
+                ],
+                "run_state": {
+                    "completed_files": [str((photos / "a.jpg").resolve())],
+                    "failed_files": [str((photos / "b.jpg").resolve())],
+                    "provider_metrics": {
+                        "provider-a": {
+                            "attempt_count": 2,
+                            "attempt_wall_clock_ms_total": 12,
+                            "wall_clock_ms_total": 12,
+                        }
+                    },
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    service = PhotoDescriptionService(
+        vision_client=RetryFailedVisionClient(),
+        provider_names=["provider-a"],
+    )
+
+    resume_state = service.inspect_resume_state(photos, output_path, recursive=False)
+    assert resume_state.skipped == 1
+    assert resume_state.failed_to_retry == 1
+    assert resume_state.pending == 1
+
+    asyncio.run(service.describe_to_file(photos, output_path, recursive=False))
+
+    assert calls == ["b.jpg"]
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["status"] == "completed"
+    assert written["failures"] == []
+    assert [item["file_name"] for item in written["records"]] == ["a.jpg", "b.jpg"]
+
+
+def test_service_rejects_resume_when_input_changes(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    Image.new("RGB", (8, 8), color="white").save(photos / "a.jpg", format="JPEG")
+    output_path = tmp_path / "descriptions.json"
+    output_path.write_text(
+        json.dumps(
+            {
+                "version": OUTPUT_VERSION,
+                "status": "running",
+                "generated_at": "2026-03-22T00:00:00+00:00",
+                "updated_at": "2026-03-22T00:00:00+00:00",
+                "input": {"directory": str((tmp_path / "other").resolve()), "recursive": False},
+                "model": {"provider": "multi_provider_pool", "providers": ["provider-a"]},
+                "provider_stats": {"provider-a": {"processed": 0, "failed": 0, "wall_clock_ms": 0, "wall_clock_ms_avg": 0}},
+                "summary": {"total_files": 0, "processed": 0, "failed": 0, "skipped": 0, "remaining": 0, "wall_clock_ms": 0},
+                "records": [],
+                "failures": [],
+                "run_state": {"completed_files": [], "failed_files": [], "provider_metrics": {}},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    service = PhotoDescriptionService(
+        vision_client=FakeVisionClient(),
+        provider_names=["provider-a"],
+    )
+
+    try:
+        service.inspect_resume_state(photos, output_path, recursive=False)
+    except SystemExit as exc:
+        assert "input directory does not match" in str(exc)
+    else:
+        raise AssertionError("Expected resume validation to fail")

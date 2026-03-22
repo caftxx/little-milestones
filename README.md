@@ -21,7 +21,6 @@ Little Milestones 是一个围绕成长记录整理的小工具项目。
 
 当前版本不包含：
 
-- 月报生成
 - 网页界面
 - 云端识图服务
 - 视频处理
@@ -90,6 +89,31 @@ uv sync --extra dev
 uv run littlems describe \
   --input ./photos \
   --output ./descriptions.json \
+  --provider-config ./providers.json
+```
+
+生成温馨中文月报：
+
+```bash
+uv run littlems generate-report \
+  --input ./descriptions.json \
+  --month 2026-03 \
+  --birth-date 2025-12-20 \
+  --baby-name 小满 \
+  --output ./report.md \
+  --provider-config ./providers.json
+```
+
+如果还想保留一份调试用 JSON，方便回看模型输入摘要和实际使用的 provider，可以额外加上：
+
+```bash
+uv run littlems generate-report \
+  --input ./descriptions.json \
+  --month 2026-03 \
+  --birth-date 2025-12-20 \
+  --baby-name 小满 \
+  --output ./report.md \
+  --json-output ./report-debug.json \
   --provider-config ./providers.json
 ```
 
@@ -229,6 +253,50 @@ uv run littlems describe \
 - `run_state.failed_files`: 当前仍处于失败状态的文件绝对路径
 
 出于恢复能力考虑，程序会在处理过程中反复重写整个 JSON 文件，但采用同目录临时文件加原子替换的方式，避免半写坏正式输出文件。
+
+## 月报生成
+
+`generate-report` 会读取 `describe` 生成的 `descriptions.json`，结合宝宝出生日期和指定月份，调用本地 OpenAI 兼容模型，生成一篇温馨的中文月报 Markdown。
+
+这个命令需要 `--provider-config`，因为月报正文不是规则模板拼接，而是由大模型基于当月素材来写作。
+
+必填参数：
+
+- `--input`：`describe` 生成的 JSON 文件
+- `--month`：目标月份，格式为 `YYYY-MM`
+- `--birth-date`：宝宝出生日期，格式为 `YYYY-MM-DD`
+- `--baby-name`：宝宝姓名，会作为月报生成的重要上下文
+- `--output`：月报 Markdown 输出路径
+- `--provider-config`：provider 配置文件路径
+
+可选参数：
+
+- `--json-output`：调试 JSON 输出路径
+- `--log-path`
+- `--log-level`
+
+月报生成时会先整理出：
+
+- 当月时间线
+- 代表照片摘要
+- 高频动作、表情、场景
+- 候选新技能
+- 宝宝当月月龄
+- 宝宝姓名
+
+然后把这些事实素材交给模型，生成一篇更自然、更有情感温度的中文月报。
+
+例如，模型产出的月报可能会像这样：
+
+```md
+# 2026年3月宝宝成长月报
+
+这个月，宝宝已经到了满2到3个月的阶段。照片里能感觉到她慢慢从安静地躺着，变成会主动回应世界的小人儿。
+
+最让人惊喜的是，三月里第一次清晰地记录到了她趴卧时抬头、看向镜头的样子。那种努力支起小脑袋、认真望过来的瞬间，会让人一下子意识到，成长真的是悄悄发生的。
+
+除了这些新本领，这个月还有很多温柔的日常：被抱在怀里时安静的神情，躺在床上时松弛的小表情，还有一点点更稳定、更有力的身体动作。
+```
 
 ## 测试
 

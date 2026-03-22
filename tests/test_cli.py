@@ -457,6 +457,152 @@ def test_validate_config_with_probe_fails_after_printing_all_failures(monkeypatc
     )
 
 
+def test_cli_runs_generate_report_command(monkeypatch, tmp_path: Path) -> None:
+    input_path = tmp_path / "descriptions.json"
+    output_path = tmp_path / "report.md"
+    json_output_path = tmp_path / "report.json"
+    config_path = _write_provider_config(tmp_path)
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    async def fake_generate_report_files(
+        *,
+        input_path: Path,
+        month: str,
+        birth_date: str,
+        baby_name: str,
+        output_path: Path,
+        settings: ProviderPoolSettings,
+        json_output_path: Path | None = None,
+    ) -> dict[str, object]:
+        captured["input_path"] = input_path
+        captured["month"] = month
+        captured["birth_date"] = birth_date
+        captured["baby_name"] = baby_name
+        captured["output_path"] = output_path
+        captured["providers"] = [provider.name for provider in settings.providers]
+        captured["json_output_path"] = json_output_path
+        output_path.write_text("# report\n", encoding="utf-8")
+        if json_output_path is not None:
+            json_output_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return {"ok": True}
+
+    monkeypatch.setattr("littlems.cli.generate_report_files", fake_generate_report_files)
+
+    exit_code = main(
+        [
+            "generate-report",
+            "--input",
+            str(input_path),
+            "--month",
+            "2026-03",
+            "--birth-date",
+            "2025-12-20",
+            "--baby-name",
+            "小满",
+            "--output",
+            str(output_path),
+            "--provider-config",
+            str(config_path),
+            "--json-output",
+            str(json_output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "input_path": input_path,
+        "month": "2026-03",
+        "birth_date": "2025-12-20",
+        "baby_name": "小满",
+        "output_path": output_path,
+        "providers": ["fast-a"],
+        "json_output_path": json_output_path,
+    }
+    assert output_path.read_text(encoding="utf-8") == "# report\n"
+    assert json.loads(json_output_path.read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_generate_report_requires_provider_config(tmp_path: Path) -> None:
+    input_path = tmp_path / "descriptions.json"
+    output_path = tmp_path / "report.md"
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        main(
+            [
+                "generate-report",
+                "--input",
+                str(input_path),
+                "--month",
+                "2026-03",
+                "--birth-date",
+                "2025-12-20",
+                "--output",
+                str(output_path),
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected generate-report to require --provider-config")
+
+
+def test_generate_report_requires_birth_date(tmp_path: Path) -> None:
+    input_path = tmp_path / "descriptions.json"
+    output_path = tmp_path / "report.md"
+    config_path = _write_provider_config(tmp_path)
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        main(
+            [
+                "generate-report",
+                "--input",
+                str(input_path),
+                "--month",
+                "2026-03",
+                "--output",
+                str(output_path),
+                "--provider-config",
+                str(config_path),
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected generate-report to require --birth-date")
+
+
+def test_generate_report_requires_baby_name(tmp_path: Path) -> None:
+    input_path = tmp_path / "descriptions.json"
+    output_path = tmp_path / "report.md"
+    config_path = _write_provider_config(tmp_path)
+    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        main(
+            [
+                "generate-report",
+                "--input",
+                str(input_path),
+                "--month",
+                "2026-03",
+                "--birth-date",
+                "2025-12-20",
+                "--output",
+                str(output_path),
+                "--provider-config",
+                str(config_path),
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected generate-report to require --baby-name")
+
+
 def test_probe_provider_pool_runs_concurrently() -> None:
     from littlems.cli import _probe_provider_pool
 

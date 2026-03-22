@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 
 from littlems.config import ProviderPoolSettings, ProviderSettings, load_provider_settings
+from littlems.report import generate_report_files
 from littlems.service import PhotoDescriptionService
 from littlems.vision import BalancedVisionClient
 from tqdm import tqdm
@@ -84,6 +85,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe",
         action="store_true",
         help="Probe each provider with a lightweight API request after validating the config",
+    )
+
+    generate_report = subparsers.add_parser("generate-report", help="Generate a warm Chinese monthly report from descriptions JSON")
+    generate_report.add_argument("--input", required=True, type=Path, help="Describe output JSON file path")
+    generate_report.add_argument("--month", required=True, help="Target month in YYYY-MM format")
+    generate_report.add_argument("--birth-date", required=True, help="Baby birth date in YYYY-MM-DD format")
+    generate_report.add_argument("--baby-name", required=True, help="Baby name used in report prompt context")
+    generate_report.add_argument("--output", required=True, type=Path, help="Output Markdown file path")
+    generate_report.add_argument(
+        "--provider-config",
+        required=True,
+        type=Path,
+        help="JSON config file containing provider definitions",
+    )
+    generate_report.add_argument(
+        "--json-output",
+        type=Path,
+        help="Optional debug JSON output path",
+    )
+    generate_report.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Logging verbosity for debugging",
+    )
+    generate_report.add_argument(
+        "--log-path",
+        type=Path,
+        help="Log file output path; defaults to ./log/littlems.log",
     )
     return parser
 
@@ -172,6 +202,31 @@ def main(argv: list[str] | None = None) -> int:
             [provider.name for provider in settings.providers],
             args.probe,
         )
+        return 0
+    if args.command == "generate-report":
+        settings = load_provider_settings(args.provider_config)
+        logger.info(
+            "starting generate-report command input=%s month=%s birth_date=%s baby_name=%s output=%s provider_config=%s providers=%s",
+            args.input,
+            args.month,
+            args.birth_date,
+            args.baby_name,
+            args.output,
+            args.provider_config,
+            [provider.name for provider in settings.providers],
+        )
+        asyncio.run(
+            generate_report_files(
+                input_path=args.input,
+                month=args.month,
+                birth_date=args.birth_date,
+                baby_name=args.baby_name,
+                output_path=args.output,
+                settings=settings,
+                json_output_path=args.json_output,
+            )
+        )
+        logger.info("generate-report command finished output=%s", args.output)
         return 0
     parser.error(f"Unsupported command: {args.command}")
     return 2

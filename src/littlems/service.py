@@ -56,7 +56,7 @@ class _RunState:
 
 
 class VisionClient(Protocol):
-    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionResult: ...
+    async def describe(self, image_path: Path) -> VisionResult: ...
 
 
 class ProgressCallback(Protocol):
@@ -68,9 +68,11 @@ class PhotoDescriptionService:
         self,
         vision_client: VisionClient,
         provider_names: list[str],
+        max_workers: int = 16,
     ) -> None:
         self._vision_client = vision_client
         self._provider_names = provider_names
+        self._max_workers = max_workers
 
     def inspect_resume_state(
         self,
@@ -155,21 +157,37 @@ class PhotoDescriptionService:
         if not pending_paths:
             return
 
-        tasks = [
-            asyncio.create_task(self._describe_one(index, image_path))
-            for index, image_path in enumerate(pending_paths)
-        ]
-
         processed = 0
-        for task in asyncio.as_completed(tasks):
-            _, image_path, record, failure, provider_attempts = await task
-            processed += 1
-            _accumulate_provider_attempts(state.current_provider_windows, provider_attempts)
-            self._merge_result_into_state(state, image_path, record=record, failure=failure)
-            if state.output_file is not None:
-                self._write_document(state, status="running")
-            if progress_callback is not None:
-                progress_callback(state.skipped_count + processed, total, image_path)
+        merge_lock = asyncio.Lock()
+        queue: asyncio.Queue[Path] = asyncio.Queue()
+        for image_path in pending_paths:
+            queue.put_nowait(image_path)
+
+        worker_count = min(self._max_workers, len(pending_paths))
+
+        async def worker() -> None:
+            nonlocal processed
+            while True:
+                try:
+                    image_path = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    image_path, record, failure, provider_attempts = await self._describe_one(image_path)
+                    async with merge_lock:
+                        processed += 1
+                        _accumulate_provider_attempts(state.current_provider_windows, provider_attempts)
+                        self._merge_result_into_state(state, image_path, record=record, failure=failure)
+                        if state.output_file is not None:
+                            self._write_document(state, status="running")
+                        if progress_callback is not None:
+                            progress_callback(state.skipped_count + processed, total, image_path)
+                finally:
+                    queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await queue.join()
+        await asyncio.gather(*workers)
 
     def _prepare_run_state(
         self,
@@ -429,10 +447,8 @@ class PhotoDescriptionService:
 
     async def _describe_one(
         self,
-        index: int,
         image_path: Path,
     ) -> tuple[
-        int,
         Path,
         dict[str, object] | None,
         dict[str, object] | None,
@@ -440,14 +456,16 @@ class PhotoDescriptionService:
     ]:
         logger.info("processing image=%s", image_path)
         try:
-            metadata = await asyncio.to_thread(extract_photo_metadata, image_path)
+            result = await self._vision_client.describe(image_path)
+            metadata = result.metadata
+            if metadata is None:
+                metadata = await asyncio.to_thread(extract_photo_metadata, image_path)
             logger.debug("metadata extracted image=%s metadata_source=%s", image_path, metadata.metadata_source)
-            result = await self._vision_client.describe(image_path, metadata)
             logger.debug("vision description complete image=%s summary=%s", image_path, result.description.summary)
-            return index, image_path, _build_record(image_path, metadata, result), None, result.provider_attempts
+            return image_path, _build_record(image_path, metadata, result), None, result.provider_attempts
         except VisionProviderFailure as exc:
             logger.exception("failed to process image=%s", image_path)
-            return index, image_path, None, {
+            return image_path, None, {
                 "file_name": image_path.name,
                 "file_path": str(image_path.resolve()),
                 "error": str(exc),
@@ -457,7 +475,7 @@ class PhotoDescriptionService:
             }, exc.provider_attempts
         except Exception as exc:
             logger.exception("failed to process image=%s", image_path)
-            return index, image_path, None, {
+            return image_path, None, {
                 "file_name": image_path.name,
                 "file_path": str(image_path.resolve()),
                 "error": str(exc),

@@ -48,3 +48,4 @@ class VisionResult:
     description: VisionDescription
     provider_elapsed_ms: int
     provider_attempts: list[VisionProviderAttempt]
+    metadata: PhotoMetadata | None = None

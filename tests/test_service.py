@@ -31,7 +31,7 @@ def _attempt(
 
 
 class FakeVisionClient:
-    async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+    async def describe(self, image_path: Path) -> VisionResult:
         if image_path.name == "broken.jpg":
             raise RuntimeError("cannot decode")
         windows = {
@@ -150,7 +150,7 @@ def test_service_builds_stats_for_mixed_supported_formats(monkeypatch, tmp_path:
         (photos / name).write_bytes(b"data")
 
     class MixedFormatVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             windows = {
                 "a.heif": (0, 10),
                 "b.dng": (10, 25),
@@ -206,7 +206,7 @@ def test_service_reports_progress_for_successes_and_failures(tmp_path: Path) -> 
         Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
 
     class MixedVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             if image_path.name == "broken.jpg":
                 raise RuntimeError("boom")
             return VisionResult(
@@ -286,6 +286,57 @@ def test_service_handles_empty_directory_without_progress(tmp_path: Path) -> Non
     assert progress_events == []
 
 
+def test_service_limits_inflight_work_to_max_workers(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for index in range(5):
+        Image.new("RGB", (8, 8), color="white").save(photos / f"{index}.jpg", format="JPEG")
+
+    active = 0
+    peak = 0
+    lock = asyncio.Lock()
+
+    class SlowVisionClient:
+        async def describe(self, image_path: Path) -> VisionResult:
+            nonlocal active, peak
+            async with lock:
+                active += 1
+                peak = max(peak, active)
+            await asyncio.sleep(0.02)
+            async with lock:
+                active -= 1
+            return VisionResult(
+                provider=VisionProvider(
+                    name="provider-a",
+                    base_url="http://example.test/v1",
+                    model="test-model",
+                ),
+                provider_elapsed_ms=5,
+                provider_attempts=[_attempt("provider-a", start_ms=0, end_ms=5, ok=True)],
+                description=VisionDescription(
+                    summary=image_path.name,
+                    baby_present=True,
+                    actions=[],
+                    expressions=[],
+                    scene="room",
+                    objects=[],
+                    highlights=[],
+                    uncertainty=None,
+                ),
+            )
+
+    service = PhotoDescriptionService(
+        vision_client=SlowVisionClient(),
+        provider_names=["provider-a"],
+        max_workers=2,
+    )
+
+    document = asyncio.run(service.describe_directory(photos, recursive=False))
+
+    assert document["summary"]["processed"] == 5
+    assert peak == 2
+
+
 def test_service_keeps_input_order_under_async_parallelism(tmp_path: Path) -> None:
     photos = tmp_path / "photos"
     photos.mkdir()
@@ -293,7 +344,7 @@ def test_service_keeps_input_order_under_async_parallelism(tmp_path: Path) -> No
         Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
 
     class OutOfOrderVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             delays = {"a.jpg": 0.03, "b.jpg": 0.01, "c.jpg": 0.02}
             await asyncio.sleep(delays[image_path.name])
             return VisionResult(
@@ -351,7 +402,7 @@ def test_service_accumulates_provider_elapsed_time_for_failure_attempts(tmp_path
     Image.new("RGB", (8, 8), color="white").save(photos / "broken.jpg", format="JPEG")
 
     class FailureVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             raise VisionProviderFailure(
                 image_path.name,
                 [
@@ -385,7 +436,7 @@ def test_service_reports_provider_wall_clock_for_overlapping_attempts(tmp_path: 
         Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
 
     class OverlappingVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             attempt_by_name = {
                 "a.jpg": _attempt("provider-a", start_ms=0, end_ms=50, ok=True),
                 "b.jpg": _attempt("provider-a", start_ms=10, end_ms=60, ok=True),
@@ -433,7 +484,7 @@ def test_service_reports_top_level_wall_clock_for_parallel_run(tmp_path: Path) -
         Image.new("RGB", (8, 8), color="white").save(photos / name, format="JPEG")
 
     class SlowVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             await asyncio.sleep(0.03)
             return VisionResult(
                 provider=VisionProvider(
@@ -473,7 +524,7 @@ def test_service_tracks_multiple_provider_windows_on_failure_retry(tmp_path: Pat
     Image.new("RGB", (8, 8), color="white").save(photos / "sample.jpg", format="JPEG")
 
     class RetryVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             return VisionResult(
                 provider=VisionProvider(
                     name="provider-b",
@@ -518,7 +569,7 @@ def test_service_writes_incremental_running_document(tmp_path: Path) -> None:
     output_path = tmp_path / "descriptions.json"
 
     class SlowVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
+        async def describe(self, image_path: Path) -> VisionResult:
             await asyncio.sleep(0.01 if image_path.name == "a.jpg" else 0.02)
             return VisionResult(
                 provider=VisionProvider(
@@ -581,8 +632,7 @@ def test_service_resumes_and_skips_completed_files(tmp_path: Path) -> None:
     calls: list[str] = []
 
     class ResumeVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
-            del metadata
+        async def describe(self, image_path: Path) -> VisionResult:
             calls.append(image_path.name)
             return VisionResult(
                 provider=VisionProvider(
@@ -696,8 +746,7 @@ def test_service_retries_failures_and_replaces_them_with_success(tmp_path: Path)
     calls: list[str] = []
 
     class RetryFailedVisionClient:
-        async def describe(self, image_path: Path, metadata: object) -> VisionResult:
-            del metadata
+        async def describe(self, image_path: Path) -> VisionResult:
             calls.append(image_path.name)
             return VisionResult(
                 provider=VisionProvider(

@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from littlems.cli import main
+from littlems.cli import build_service, main
 from littlems.config import ProviderPoolSettings, ProviderSettings
 from littlems.service import ResumeState
 
@@ -60,8 +60,9 @@ def test_cli_runs_describe_command(monkeypatch, tmp_path: Path) -> None:
 
     captured_settings: dict[str, ProviderPoolSettings] = {}
 
-    def stub_build_service(settings: ProviderPoolSettings) -> StubService:
+    def stub_build_service(settings: ProviderPoolSettings, *, max_workers: int) -> StubService:
         captured_settings["settings"] = settings
+        captured["max_workers"] = max_workers
         return StubService()
 
     monkeypatch.setattr("littlems.cli.build_service", stub_build_service)
@@ -84,6 +85,7 @@ def test_cli_runs_describe_command(monkeypatch, tmp_path: Path) -> None:
         "input_dir": photos,
         "output_file": output_path,
         "recursive": True,
+        "max_workers": 16,
     }
     assert captured_settings["settings"] == ProviderPoolSettings(
         providers=[
@@ -142,7 +144,7 @@ def test_cli_log_path_overrides_default(monkeypatch, tmp_path: Path) -> None:
         ) -> None:
             output_file.write_text(json.dumps({"ok": True}), encoding="utf-8")
 
-    monkeypatch.setattr("littlems.cli.build_service", lambda settings: StubService())
+    monkeypatch.setattr("littlems.cli.build_service", lambda settings, *, max_workers: StubService())
     monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
 
     exit_code = main(
@@ -214,7 +216,7 @@ def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> Non
             if progress_callback is not None:
                 progress_callback(4, 8, photos / "d.jpg")
 
-    monkeypatch.setattr("littlems.cli.build_service", lambda settings: StubService())
+    monkeypatch.setattr("littlems.cli.build_service", lambda settings, *, max_workers: StubService())
     monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
 
     exit_code = main(
@@ -235,6 +237,104 @@ def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> Non
     assert progress.total == 8
     assert progress.refreshed is True
     assert progress.n == 4
+
+
+def test_build_service_defaults_max_workers_to_16() -> None:
+    service = build_service(
+        ProviderPoolSettings(
+            providers=[
+                ProviderSettings("fast-a", "http://a.example/v1", "key-a", "model-a"),
+            ]
+        )
+    )
+
+    assert service._max_workers == 16
+
+
+def test_cli_passes_custom_max_workers(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    output_path = tmp_path / "descriptions.json"
+    config_path = _write_provider_config(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    class StubProgressBar:
+        def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
+            self.total = total
+            self.n = 0
+
+        def __enter__(self) -> StubProgressBar:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def update(self, delta: int) -> None:
+            self.n += delta
+
+    class StubService:
+        async def describe_to_file(
+            self,
+            input_dir: Path,
+            output_file: Path,
+            recursive: bool,
+            progress_callback: object = None,
+        ) -> None:
+            del input_dir, recursive, progress_callback
+            output_file.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+    def stub_build_service(settings: ProviderPoolSettings, *, max_workers: int) -> StubService:
+        captured["providers"] = [provider.name for provider in settings.providers]
+        captured["max_workers"] = max_workers
+        return StubService()
+
+    monkeypatch.setattr("littlems.cli.build_service", stub_build_service)
+    monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
+
+    exit_code = main(
+        [
+            "describe",
+            "--input",
+            str(photos),
+            "--output",
+            str(output_path),
+            "--provider-config",
+            str(config_path),
+            "--max-workers",
+            "7",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {"providers": ["fast-a"], "max_workers": 7}
+
+
+def test_cli_rejects_invalid_max_workers(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    output_path = tmp_path / "descriptions.json"
+    config_path = _write_provider_config(tmp_path)
+
+    try:
+        main(
+            [
+                "describe",
+                "--input",
+                str(photos),
+                "--output",
+                str(output_path),
+                "--provider-config",
+                str(config_path),
+                "--max-workers",
+                "0",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected CLI to reject non-positive --max-workers")
 
 
 def test_cli_requires_provider_config(tmp_path: Path) -> None:

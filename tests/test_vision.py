@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -290,6 +291,79 @@ def test_balanced_client_reports_integer_elapsed_ms(monkeypatch, tmp_path: Path)
 
     assert isinstance(result.provider_elapsed_ms, int)
     assert isinstance(result.provider_attempts[0].elapsed_ms, int)
+
+
+def test_balanced_client_waits_for_provider_before_preparing_next_image(monkeypatch, tmp_path: Path) -> None:
+    image_path = _create_sample_image(tmp_path)
+    prepare_calls: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    def fake_prepare(path: Path):
+        prepare_calls.append(path.name)
+        return SimpleNamespace(metadata=PhotoMetadata())
+
+    async def fake_describe(self: OpenAIVisionClient, image_path: Path, metadata: object) -> object:
+        del metadata
+        if image_path.name == "first.jpg":
+            first_started.set()
+            await release_first.wait()
+        return _make_description("ok")
+
+    monkeypatch.setattr("littlems.vision._prepare_vision_input", fake_prepare)
+    monkeypatch.setattr("littlems.vision.OpenAIVisionClient.describe", fake_describe)
+
+    client = BalancedVisionClient(
+        [
+            ProviderSettings("only", "http://example.test/only/v1", "key", "model-only", max_inflight=1),
+        ]
+    )
+
+    async def run() -> None:
+        first_task = asyncio.create_task(client.describe(image_path.with_name("first.jpg")))
+        await first_started.wait()
+        second_task = asyncio.create_task(client.describe(image_path.with_name("second.jpg")))
+        await asyncio.sleep(0.02)
+        assert prepare_calls == ["first.jpg"]
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+    asyncio.run(run())
+    assert prepare_calls == ["first.jpg", "second.jpg"]
+
+
+def test_balanced_client_prepares_image_once_across_provider_retries(monkeypatch, tmp_path: Path) -> None:
+    image_path = _create_sample_image(tmp_path)
+    prepare_calls: list[str] = []
+    attempted: list[str] = []
+
+    def fake_prepare(path: Path):
+        prepare_calls.append(path.name)
+        return SimpleNamespace(metadata=PhotoMetadata())
+
+    async def fake_describe(self: OpenAIVisionClient, image_path: Path, metadata: object) -> object:
+        del image_path, metadata
+        provider_name = "first" if self._base_url.endswith("first/v1") else "second"
+        attempted.append(provider_name)
+        if provider_name == "first":
+            raise RuntimeError("boom")
+        return _make_description("ok")
+
+    monkeypatch.setattr("littlems.vision._prepare_vision_input", fake_prepare)
+    monkeypatch.setattr("littlems.vision.OpenAIVisionClient.describe", fake_describe)
+
+    client = BalancedVisionClient(
+        [
+            ProviderSettings("first", "http://example.test/first/v1", "key", "model-first"),
+            ProviderSettings("second", "http://example.test/second/v1", "key", "model-second"),
+        ]
+    )
+
+    result = asyncio.run(client.describe(image_path))
+
+    assert attempted == ["first", "second"]
+    assert prepare_calls == ["sample.jpg"]
+    assert result.provider.name == "second"
 
 
 def test_parse_description_fails_for_non_json_response() -> None:

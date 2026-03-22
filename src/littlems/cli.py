@@ -16,11 +16,12 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
-def build_service(settings: ProviderPoolSettings) -> PhotoDescriptionService:
+def build_service(settings: ProviderPoolSettings, *, max_workers: int = 16) -> PhotoDescriptionService:
     client = BalancedVisionClient(settings.providers)
     return PhotoDescriptionService(
         vision_client=client,
         provider_names=[provider.name for provider in settings.providers],
+        max_workers=max_workers,
     )
 
 
@@ -53,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-path",
         type=Path,
         help="Log file output path; defaults to ./log/littlems.log",
+    )
+    describe.add_argument(
+        "--max-workers",
+        type=_positive_int,
+        default=16,
+        help="Maximum number of file workers to run concurrently (default: 16)",
     )
 
     validate = subparsers.add_parser("validate-config", help="Validate a provider config file")
@@ -96,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             args.provider_config,
             [provider.name for provider in settings.providers],
         )
-        service = build_service(settings)
+        service = build_service(settings, max_workers=args.max_workers)
         resume_state = None
         inspect_resume = getattr(service, "inspect_resume_state", None)
         if callable(inspect_resume):
@@ -174,6 +181,13 @@ def _resolve_log_path(args: argparse.Namespace) -> Path:
     if args.log_path is not None:
         return args.log_path
     return Path.cwd() / "log" / "littlems.log"
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _configure_logging(level_name: str, log_path: Path) -> None:

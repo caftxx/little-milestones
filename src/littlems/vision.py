@@ -14,6 +14,7 @@ import httpx
 from PIL import ImageOps
 
 from littlems.config import ProviderSettings
+from littlems.exif import extract_photo_metadata
 from littlems.imaging import open_image
 from littlems.models import (
     PhotoMetadata,
@@ -40,12 +41,16 @@ class OpenAIVisionClient:
         self._model = model
         self._timeout = timeout
 
-    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription:
+    async def describe(
+        self,
+        image_path: Path,
+        prepared_input: PreparedVisionInput | PhotoMetadata,
+    ) -> VisionDescription:
+        if isinstance(prepared_input, PhotoMetadata):
+            prepared_input = _prepared_input_from_metadata(image_path, prepared_input)
         logger.debug("building vision request image=%s model=%s", image_path, self._model)
-        schema_payload = await asyncio.to_thread(
-            _build_payload,
-            image_path=image_path,
-            metadata=metadata,
+        schema_payload = _build_payload(
+            prepared_input=prepared_input,
             model=self._model,
             response_format=_json_schema_response_format(),
         )
@@ -69,10 +74,8 @@ class OpenAIVisionClient:
                 )
                 logger.info("falling back from json_schema to text image=%s", image_path)
 
-            text_payload = await asyncio.to_thread(
-                _build_payload,
-                image_path=image_path,
-                metadata=metadata,
+            text_payload = _build_payload(
+                prepared_input=prepared_input,
                 model=self._model,
                 response_format={"type": "text"},
             )
@@ -125,6 +128,15 @@ class _ProviderRuntime:
     inflight: int = 0
 
 
+@dataclass(slots=True)
+class PreparedVisionInput:
+    metadata: PhotoMetadata
+    metadata_payload: dict[str, object]
+    mime_type: str
+    image_bytes: bytes
+    data_url: str
+
+
 class VisionProviderFailure(RuntimeError):
     def __init__(
         self,
@@ -161,15 +173,22 @@ class BalancedVisionClient:
         ]
         self._condition = asyncio.Condition()
 
-    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionResult:
+    async def describe(self, image_path: Path, metadata: PhotoMetadata | None = None) -> VisionResult:
         attempted: set[int] = set()
         provider_attempts: list[VisionProviderAttempt] = []
+        prepared_input: PreparedVisionInput | None = None
 
         while len(attempted) < len(self._providers):
             index, runtime = await self._acquire_provider(excluded=attempted)
             started_ns = time.perf_counter_ns()
             try:
-                description = await runtime.client.describe(image_path, metadata)
+                if metadata is None:
+                    if prepared_input is None:
+                        prepared_input = await asyncio.to_thread(_prepare_vision_input, image_path)
+                    request_input: PreparedVisionInput | PhotoMetadata = prepared_input
+                else:
+                    request_input = metadata
+                description = await runtime.client.describe(image_path, request_input)
                 finished_ns = time.perf_counter_ns()
                 elapsed_ms = _elapsed_ms_between(started_ns, finished_ns)
                 attempt = VisionProviderAttempt(
@@ -189,6 +208,7 @@ class BalancedVisionClient:
                     description=description,
                     provider_elapsed_ms=sum(item.elapsed_ms for item in provider_attempts),
                     provider_attempts=provider_attempts,
+                    metadata=prepared_input.metadata if prepared_input is not None else metadata,
                 )
             except Exception as exc:
                 finished_ns = time.perf_counter_ns()
@@ -254,8 +274,7 @@ def _elapsed_ms_between(started_ns: int, finished_ns: int) -> int:
 
 def _build_payload(
     *,
-    image_path: Path,
-    metadata: PhotoMetadata,
+    prepared_input: PreparedVisionInput,
     model: str,
     response_format: dict[str, object],
 ) -> dict[str, object]:
@@ -280,12 +299,12 @@ def _build_payload(
                         "type": "text",
                         "text": (
                             "Known metadata:\n"
-                            f"{json.dumps(_metadata_payload(metadata), ensure_ascii=False)}"
+                            f"{json.dumps(prepared_input.metadata_payload, ensure_ascii=False)}"
                         ),
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": _encode_image_as_data_url(image_path)},
+                        "image_url": {"url": prepared_input.data_url},
                     },
                 ],
             },
@@ -340,6 +359,23 @@ def _encode_image_as_data_url(image_path: Path) -> str:
     mime_type, image_bytes = _prepare_image_bytes(image_path)
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _prepare_vision_input(image_path: Path) -> PreparedVisionInput:
+    metadata = extract_photo_metadata(image_path)
+    return _prepared_input_from_metadata(image_path, metadata)
+
+
+def _prepared_input_from_metadata(image_path: Path, metadata: PhotoMetadata) -> PreparedVisionInput:
+    mime_type, image_bytes = _prepare_image_bytes(image_path)
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return PreparedVisionInput(
+        metadata=metadata,
+        metadata_payload=_metadata_payload(metadata),
+        mime_type=mime_type,
+        image_bytes=image_bytes,
+        data_url=f"data:{mime_type};base64,{encoded}",
+    )
 
 
 def _prepare_image_bytes(image_path: Path) -> tuple[str, bytes]:

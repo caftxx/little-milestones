@@ -1,29 +1,26 @@
 from __future__ import annotations
 
-import asyncio
 import argparse
+import asyncio
 import logging
 import os
 from pathlib import Path
 
-from littlems.config import Settings, load_settings
+import httpx
+
+from littlems.config import ProviderPoolSettings, ProviderSettings, load_provider_settings
 from littlems.service import PhotoDescriptionService
-from littlems.vision import OpenAIVisionClient
+from littlems.vision import BalancedVisionClient
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 
-def build_service(settings: Settings) -> PhotoDescriptionService:
-    client = OpenAIVisionClient(
-        base_url=settings.base_url,
-        api_key=settings.api_key,
-        model=settings.vision_model,
-    )
+def build_service(settings: ProviderPoolSettings) -> PhotoDescriptionService:
+    client = BalancedVisionClient(settings.providers)
     return PhotoDescriptionService(
         vision_client=client,
-        model_name=settings.vision_model,
-        base_url=settings.base_url,
+        provider_names=[provider.name for provider in settings.providers],
     )
 
 
@@ -35,21 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
     describe.add_argument("--input", required=True, type=Path, help="Directory containing photos")
     describe.add_argument("--output", required=True, type=Path, help="Output JSON file path")
     describe.add_argument(
+        "--provider-config",
+        required=True,
+        type=Path,
+        help="JSON config file containing provider definitions",
+    )
+    describe.add_argument(
         "--recursive",
         action="store_true",
+        default=True,
         help="Scan subdirectories recursively",
-    )
-    describe.add_argument(
-        "--openai-base-url",
-        help="OpenAI-compatible API base URL; overrides OPENAI_BASE_URL",
-    )
-    describe.add_argument(
-        "--openai-api-key",
-        help="OpenAI-compatible API key; overrides OPENAI_API_KEY",
-    )
-    describe.add_argument(
-        "--vision-model",
-        help="Vision model name; overrides VISION_MODEL",
     )
     describe.add_argument(
         "--log-level",
@@ -62,11 +54,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Log file output path; defaults to ./log/littlems.log",
     )
-    describe.add_argument(
-        "--parallelism",
-        type=_positive_int,
-        default=4,
-        help="Maximum number of in-flight image processing tasks; defaults to 4",
+
+    validate = subparsers.add_parser("validate-config", help="Validate a provider config file")
+    validate.add_argument(
+        "--provider-config",
+        required=True,
+        type=Path,
+        help="JSON config file containing provider definitions",
+    )
+    validate.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+        help="Logging verbosity for debugging",
+    )
+    validate.add_argument(
+        "--log-path",
+        type=Path,
+        help="Log file output path; defaults to ./log/littlems.log",
+    )
+    validate.add_argument(
+        "--probe",
+        action="store_true",
+        help="Probe each provider with a lightweight API request after validating the config",
     )
     return parser
 
@@ -77,14 +87,14 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.log_level, _resolve_log_path(args))
 
     if args.command == "describe":
-        settings = _resolve_settings(args)
+        settings = load_provider_settings(args.provider_config)
         logger.info(
-            "starting describe command input=%s output=%s recursive=%s model=%s base_url=%s",
+            "starting describe command input=%s output=%s recursive=%s provider_config=%s providers=%s",
             args.input,
             args.output,
             args.recursive,
-            settings.vision_model,
-            settings.base_url,
+            args.provider_config,
+            [provider.name for provider in settings.providers],
         )
         service = build_service(settings)
         with tqdm(
@@ -98,7 +108,6 @@ def main(argv: list[str] | None = None) -> int:
                     args.input,
                     args.output,
                     recursive=args.recursive,
-                    parallelism=args.parallelism,
                     progress_callback=lambda processed, total, image_path: _update_progress(
                         progress,
                         processed,
@@ -109,47 +118,37 @@ def main(argv: list[str] | None = None) -> int:
             )
         logger.info("describe command finished output=%s", args.output)
         return 0
+    if args.command == "validate-config":
+        settings = load_provider_settings(args.provider_config)
+        if args.probe:
+            probe_results = asyncio.run(_probe_provider_pool(settings))
+            for result in probe_results:
+                if result["ok"]:
+                    print(
+                        f"OK   {result['name']}  {result['base_url']}  model={result['model']}"
+                    )
+                else:
+                    print(
+                        f"FAIL {result['name']}  {result['base_url']}  model={result['model']}  "
+                        f"kind={result['error_kind']}  error={result['error']}"
+                    )
+            failures = [result for result in probe_results if not result["ok"]]
+            if failures:
+                failed_names = ", ".join(str(result["name"]) for result in failures)
+                raise SystemExit(f"Provider probe failed for: {failed_names}")
+        else:
+            print(
+                f"Config OK: {args.provider_config} ({len(settings.providers)} providers)"
+            )
+        logger.info(
+            "validated provider config path=%s providers=%s probe=%s",
+            args.provider_config,
+            [provider.name for provider in settings.providers],
+            args.probe,
+        )
+        return 0
     parser.error(f"Unsupported command: {args.command}")
     return 2
-
-
-def _resolve_settings(args: argparse.Namespace) -> Settings:
-    env_settings = load_settings()
-    settings = Settings(
-        base_url=_clean_base_url(args.openai_base_url) or env_settings.base_url,
-        api_key=(args.openai_api_key or env_settings.api_key),
-        vision_model=(args.vision_model or env_settings.vision_model),
-    )
-    missing_fields = [
-        env_name
-        for env_name, value in (
-            ("OPENAI_BASE_URL", settings.base_url),
-            ("OPENAI_API_KEY", settings.api_key),
-            ("VISION_MODEL", settings.vision_model),
-        )
-        if not value
-    ]
-    if missing_fields:
-        missing_text = ", ".join(missing_fields)
-        raise SystemExit(
-            "Missing OpenAI configuration. Provide CLI arguments or set environment variables: "
-            f"{missing_text}"
-        )
-    return settings
-
-
-def _clean_base_url(value: str | None) -> str | None:
-    if value is None:
-        return None
-    text = value.strip().rstrip("/")
-    return text or None
-
-
-def _positive_int(value: str) -> int:
-    number = int(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return number
 
 
 def _resolve_log_path(args: argparse.Namespace) -> Path:
@@ -174,6 +173,101 @@ def _update_progress(progress: tqdm, processed: int, total: int, image_path: Pat
     if progress.total != total:
         progress.total = total
     progress.update(processed - progress.n)
+
+
+async def _probe_provider_pool(settings: ProviderPoolSettings) -> list[dict[str, object]]:
+    tasks = [
+        asyncio.create_task(_probe_provider(provider))
+        for provider in settings.providers
+    ]
+    return await asyncio.gather(*tasks)
+
+
+async def _probe_provider(provider: ProviderSettings) -> dict[str, object]:
+    timeout = 5.0
+    logger.info("probing provider name=%s base_url=%s model=%s", provider.name, provider.base_url, provider.vision_model)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{provider.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {provider.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": provider.vision_model,
+                    "temperature": 0,
+                    "max_tokens": 1,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Reply with OK.",
+                        }
+                    ],
+                },
+            )
+        if response.is_error:
+            return {
+                "name": provider.name,
+                "base_url": provider.base_url,
+                "model": provider.vision_model,
+                "ok": False,
+                "error_kind": _classify_http_error(response.status_code),
+                "error": f"HTTP {response.status_code} {response.text.strip()}",
+            }
+        return {
+            "name": provider.name,
+            "base_url": provider.base_url,
+            "model": provider.vision_model,
+            "ok": True,
+            "error_kind": None,
+            "error": None,
+        }
+    except httpx.TimeoutException as exc:
+        return {
+            "name": provider.name,
+            "base_url": provider.base_url,
+            "model": provider.vision_model,
+            "ok": False,
+            "error_kind": "timeout",
+            "error": str(exc),
+        }
+    except httpx.ConnectError as exc:
+        return {
+            "name": provider.name,
+            "base_url": provider.base_url,
+            "model": provider.vision_model,
+            "ok": False,
+            "error_kind": "connect_error",
+            "error": str(exc),
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "name": provider.name,
+            "base_url": provider.base_url,
+            "model": provider.vision_model,
+            "ok": False,
+            "error_kind": "http_error",
+            "error": str(exc),
+        }
+
+
+def _classify_http_error(status_code: int) -> str:
+    if status_code == 400:
+        return "bad_request"
+    if status_code == 401:
+        return "unauthorized"
+    if status_code == 403:
+        return "forbidden"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 408:
+        return "timeout"
+    if status_code == 429:
+        return "rate_limited"
+    if 500 <= status_code <= 599:
+        return "server_error"
+    return "http_error"
 
 
 if __name__ == "__main__":

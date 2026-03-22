@@ -23,3 +23,16 @@ class VisionDescription:
     objects: list[str]
     highlights: list[str]
     uncertainty: str | None
+
+
+@dataclass(slots=True)
+class VisionProvider:
+    name: str
+    base_url: str
+    model: str
+
+
+@dataclass(slots=True)
+class VisionResult:
+    provider: VisionProvider
+    description: VisionDescription

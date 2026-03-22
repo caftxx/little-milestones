@@ -46,42 +46,63 @@ Little Milestones v1 的目标，就是把这条链路先跑通：
 uv sync --extra dev
 ```
 
-可以通过环境变量配置本地模型：
+先准备一个 provider 配置文件。仓库里已经提供了示例 [`providers.example.json`](/mnt/c/Users/caft/Desktop/code/little-milestones/providers.example.json)，可以直接复制一份改成自己的配置。
 
-```powershell
-$env:OPENAI_BASE_URL="http://127.0.0.1:1234/v1"
-$env:OPENAI_API_KEY="local"
-$env:VISION_MODEL="your-local-vision-model"
+示例内容如下：
+
+```json
+{
+  "providers": [
+    {
+      "name": "vision-a",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "api_key": "local",
+      "vision_model": "your-local-vision-model",
+      "max_inflight": 2
+    },
+    {
+      "name": "vision-b",
+      "base_url": "http://192.168.1.20:1234/v1",
+      "api_key": "local",
+      "vision_model": "your-other-vision-model",
+      "max_inflight": 1
+    }
+  ]
+}
 ```
 
 运行命令：
 
 ```bash
-uv run littlems describe --input ./photos --output ./descriptions.json
-```
-
-也可以直接通过命令行传入，且命令行参数优先级高于环境变量：
-
-```bash
 uv run littlems describe \
   --input ./photos \
   --output ./descriptions.json \
-  --openai-base-url http://127.0.0.1:1234/v1 \
-  --openai-api-key local \
-  --vision-model your-local-vision-model
+  --provider-config ./providers.json
 ```
+
+如果想先验证配置文件本身是否可用，可以先运行：
+
+```bash
+uv run littlems validate-config --provider-config ./providers.json
+```
+
+如果还想顺便逐个 provider 做一次轻量接口探测，可以加上 `--probe`：
+
+```bash
+uv run littlems validate-config --provider-config ./providers.json --probe
+```
+
+带 `--probe` 时，终端会按 provider 输出 `OK` 或 `FAIL` 摘要，便于快速定位是哪台机器或哪个模型配置有问题。
+失败摘要会额外给出一个简短的 `kind` 分类，例如 `timeout`、`unauthorized`、`not_found`、`rate_limited`。
 
 可选参数：
 
 - `--recursive`：递归扫描子目录
-- `--openai-base-url`：覆盖 `OPENAI_BASE_URL`
-- `--openai-api-key`：覆盖 `OPENAI_API_KEY`
-- `--vision-model`：覆盖 `VISION_MODEL`
-- `--parallelism`：设置并发提交的图片任务数，默认 `4`
+- `--provider-config`：provider 配置文件路径，必填
 - `--log-path`：覆盖日志文件输出路径
 - `--log-level`：设置日志级别，排查问题时可用 `DEBUG`
 
-如果命令行参数和环境变量都未提供，CLI 会直接报错并提示需要补齐配置。
+如果未提供 `--provider-config`，CLI 会直接报错。
 
 默认情况下，日志会写入当前工作目录下的 `log/littlems.log`，不会打印到终端；终端只显示处理进度条。
 
@@ -91,11 +112,11 @@ uv run littlems describe \
 uv run littlems describe \
   --input ./photos \
   --output ./descriptions.json \
-  --parallelism 8 \
+  --provider-config ./providers.json \
   --log-level DEBUG
 ```
 
-`--parallelism` 控制客户端同时在途的图片任务数；实际吞吐还会受到本地模型服务端并发能力和硬件资源影响。
+不同 provider 的实际并发由各自的 `max_inflight` 控制；当某个 provider 达到上限后，调度器会优先把任务派发到其他仍有余量的 provider。
 
 如果你想自定义日志文件位置，可以显式传入：
 
@@ -103,6 +124,7 @@ uv run littlems describe \
 uv run littlems describe \
   --input ./photos \
   --output ./descriptions.json \
+  --provider-config ./providers.json \
   --log-path ./runtime/littlems-debug.log
 ```
 
@@ -113,6 +135,7 @@ uv run littlems describe \
 - 任务生成时间
 - 输入目录
 - 模型信息
+- provider 使用统计
 - 总文件数、成功数、失败数
 - `records`
 - `failures`
@@ -135,6 +158,9 @@ uv run littlems describe \
 - `highlights`
 - `uncertainty`
 - `metadata_source`
+- `provider_name`
+- `provider_base_url`
+- `provider_model`
 
 其中：
 

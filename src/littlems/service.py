@@ -8,14 +8,14 @@ from pathlib import Path
 from typing import Protocol
 
 from littlems.exif import extract_photo_metadata
-from littlems.models import PhotoMetadata, VisionDescription
+from littlems.models import PhotoMetadata, VisionResult
 from littlems.scanner import scan_photo_paths
 
 logger = logging.getLogger(__name__)
 
 
 class VisionClient(Protocol):
-    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionDescription: ...
+    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionResult: ...
 
 
 class ProgressCallback(Protocol):
@@ -26,31 +26,31 @@ class PhotoDescriptionService:
     def __init__(
         self,
         vision_client: VisionClient,
-        model_name: str = "local-vision-model",
-        base_url: str | None = None,
+        provider_names: list[str],
     ) -> None:
         self._vision_client = vision_client
-        self._model_name = model_name
-        self._base_url = base_url
+        self._provider_names = provider_names
 
     async def describe_directory(
         self,
         input_dir: Path,
         recursive: bool = False,
-        parallelism: int = 4,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, object]:
         logger.info("scanning input directory=%s recursive=%s", input_dir, recursive)
         paths = scan_photo_paths(input_dir, recursive=recursive)
-        logger.info("found %s supported image files parallelism=%s", len(paths), parallelism)
+        logger.info("found %s supported image files", len(paths))
         total = len(paths)
         records_by_index: dict[int, dict[str, object]] = {}
         failures_by_index: dict[int, dict[str, str]] = {}
+        provider_stats = {
+            name: {"processed": 0, "failed": 0}
+            for name in self._provider_names
+        }
 
         if total:
-            semaphore = asyncio.Semaphore(parallelism)
             tasks = [
-                asyncio.create_task(self._describe_one(index, image_path, semaphore))
+                asyncio.create_task(self._describe_one(index, image_path))
                 for index, image_path in enumerate(paths)
             ]
 
@@ -60,8 +60,15 @@ class PhotoDescriptionService:
                 processed += 1
                 if record is not None:
                     records_by_index[index] = record
+                    provider_name = str(record["provider_name"])
+                    provider_stats.setdefault(provider_name, {"processed": 0, "failed": 0})
+                    provider_stats[provider_name]["processed"] += 1
                 if failure is not None:
                     failures_by_index[index] = failure
+                    provider_name = failure.get("provider_name")
+                    if provider_name:
+                        provider_stats.setdefault(provider_name, {"processed": 0, "failed": 0})
+                        provider_stats[provider_name]["failed"] += 1
                 if progress_callback is not None:
                     progress_callback(processed, total, image_path)
 
@@ -75,10 +82,10 @@ class PhotoDescriptionService:
                 "recursive": recursive,
             },
             "model": {
-                "provider": "openai_compatible",
-                "base_url": self._base_url,
-                "name": self._model_name,
+                "provider": "multi_provider_pool",
+                "providers": self._provider_names,
             },
+            "provider_stats": provider_stats,
             "summary": {
                 "total_files": len(paths),
                 "processed": len(records),
@@ -100,13 +107,11 @@ class PhotoDescriptionService:
         input_dir: Path,
         output_file: Path,
         recursive: bool = False,
-        parallelism: int = 4,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
         document = await self.describe_directory(
             input_dir,
             recursive=recursive,
-            parallelism=parallelism,
             progress_callback=progress_callback,
         )
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -121,30 +126,31 @@ class PhotoDescriptionService:
         self,
         index: int,
         image_path: Path,
-        semaphore: asyncio.Semaphore,
     ) -> tuple[int, Path, dict[str, object] | None, dict[str, str] | None]:
-        async with semaphore:
-            logger.info("processing image=%s", image_path)
-            try:
-                metadata = await asyncio.to_thread(extract_photo_metadata, image_path)
-                logger.debug("metadata extracted image=%s metadata_source=%s", image_path, metadata.metadata_source)
-                description = await self._vision_client.describe(image_path, metadata)
-                logger.debug("vision description complete image=%s summary=%s", image_path, description.summary)
-                return index, image_path, _build_record(image_path, metadata, description), None
-            except Exception as exc:
-                logger.exception("failed to process image=%s", image_path)
-                return index, image_path, None, {
-                    "file_name": image_path.name,
-                    "file_path": str(image_path.resolve()),
-                    "error": str(exc),
-                }
+        logger.info("processing image=%s", image_path)
+        try:
+            metadata = await asyncio.to_thread(extract_photo_metadata, image_path)
+            logger.debug("metadata extracted image=%s metadata_source=%s", image_path, metadata.metadata_source)
+            result = await self._vision_client.describe(image_path, metadata)
+            logger.debug("vision description complete image=%s summary=%s", image_path, result.description.summary)
+            return index, image_path, _build_record(image_path, metadata, result), None
+        except Exception as exc:
+            logger.exception("failed to process image=%s", image_path)
+            provider_name = _extract_failed_provider_name(str(exc))
+            return index, image_path, None, {
+                "file_name": image_path.name,
+                "file_path": str(image_path.resolve()),
+                "error": str(exc),
+                "provider_name": provider_name,
+            }
 
 
 def _build_record(
     image_path: Path,
     metadata: PhotoMetadata,
-    description: VisionDescription,
+    result: VisionResult,
 ) -> dict[str, object]:
+    description = result.description
     return {
         "file_name": image_path.name,
         "file_path": str(image_path.resolve()),
@@ -162,4 +168,19 @@ def _build_record(
         "highlights": description.highlights,
         "uncertainty": description.uncertainty,
         "metadata_source": metadata.metadata_source,
+        "provider_name": result.provider.name,
+        "provider_base_url": result.provider.base_url,
+        "provider_model": result.provider.model,
     }
+
+
+def _extract_failed_provider_name(error_text: str) -> str | None:
+    prefix = "All providers failed for "
+    if prefix not in error_text:
+        return None
+    _, _, details = error_text.partition(": ")
+    if not details:
+        return None
+    first_entry, _, _ = details.partition("; ")
+    provider_name, _, _ = first_entry.partition(": ")
+    return provider_name or None

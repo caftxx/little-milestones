@@ -8,9 +8,11 @@ import httpx
 import pytest
 from PIL import Image
 
+from littlems.config import ProviderSettings
 from littlems.models import PhotoMetadata
 from littlems.vision import (
     MAX_INLINE_IMAGE_BYTES,
+    BalancedVisionClient,
     OpenAIVisionClient,
     _encode_image_as_data_url,
     _parse_description,
@@ -62,7 +64,7 @@ def test_vision_client_uses_json_schema_when_supported(monkeypatch, tmp_path: Pa
                                         "highlights": ["good grip"],
                                         "uncertainty": None,
                                     }
-                                )
+                                ),
                             }
                         }
                     ]
@@ -177,6 +179,89 @@ def test_vision_client_falls_back_to_text_when_schema_is_rejected(monkeypatch, t
     assert calls[1]["response_format"] == {"type": "text"}
 
 
+def test_balanced_client_uses_lowest_inflight_and_provider_capacity(monkeypatch, tmp_path: Path) -> None:
+    image_path = _create_sample_image(tmp_path)
+    active = {"slow": 0, "fast": 0}
+    seen: list[str] = []
+
+    async def fake_describe(self: OpenAIVisionClient, image_path: Path, metadata: PhotoMetadata) -> object:
+        name = "slow" if self._base_url.endswith("slow/v1") else "fast"
+        active[name] += 1
+        seen.append(name)
+        await asyncio.sleep(0.05 if name == "slow" else 0.01)
+        active[name] -= 1
+        return _make_description(f"{name}-{image_path.name}")
+
+    monkeypatch.setattr("littlems.vision.OpenAIVisionClient.describe", fake_describe)
+
+    client = BalancedVisionClient(
+        [
+            ProviderSettings("slow", "http://example.test/slow/v1", "key", "model-slow", max_inflight=1),
+            ProviderSettings("fast", "http://example.test/fast/v1", "key", "model-fast", max_inflight=2),
+        ]
+    )
+
+    async def run() -> list[object]:
+        tasks = [
+            asyncio.create_task(client.describe(image_path.with_name(f"{index}.jpg"), PhotoMetadata()))
+            for index in range(3)
+        ]
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(run())
+
+    assert [result.provider.name for result in results] == ["slow", "fast", "fast"]
+    assert seen.count("slow") == 1
+    assert seen.count("fast") == 2
+    assert active == {"slow": 0, "fast": 0}
+
+
+def test_balanced_client_retries_with_other_provider_on_failure(monkeypatch, tmp_path: Path) -> None:
+    image_path = _create_sample_image(tmp_path)
+    attempted: list[str] = []
+
+    async def fake_describe(self: OpenAIVisionClient, image_path: Path, metadata: PhotoMetadata) -> object:
+        provider_name = "first" if self._base_url.endswith("first/v1") else "second"
+        attempted.append(provider_name)
+        if provider_name == "first":
+            raise RuntimeError("boom")
+        return _make_description("ok")
+
+    monkeypatch.setattr("littlems.vision.OpenAIVisionClient.describe", fake_describe)
+
+    client = BalancedVisionClient(
+        [
+            ProviderSettings("first", "http://example.test/first/v1", "key", "model-first"),
+            ProviderSettings("second", "http://example.test/second/v1", "key", "model-second"),
+        ]
+    )
+
+    result = asyncio.run(client.describe(image_path, PhotoMetadata()))
+
+    assert attempted == ["first", "second"]
+    assert result.provider.name == "second"
+    assert result.provider.model == "model-second"
+
+
+def test_balanced_client_raises_when_all_providers_fail(monkeypatch, tmp_path: Path) -> None:
+    image_path = _create_sample_image(tmp_path)
+
+    async def fake_describe(self: OpenAIVisionClient, image_path: Path, metadata: PhotoMetadata) -> object:
+        raise RuntimeError(f"failed from {self._base_url}")
+
+    monkeypatch.setattr("littlems.vision.OpenAIVisionClient.describe", fake_describe)
+
+    client = BalancedVisionClient(
+        [
+            ProviderSettings("first", "http://example.test/first/v1", "key", "model-first"),
+            ProviderSettings("second", "http://example.test/second/v1", "key", "model-second"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="All providers failed"):
+        asyncio.run(client.describe(image_path, PhotoMetadata()))
+
+
 def test_parse_description_fails_for_non_json_response() -> None:
     with pytest.raises(json.JSONDecodeError):
         _parse_description("not json")
@@ -236,6 +321,21 @@ def _create_sample_image(tmp_path: Path) -> Path:
     image_path = tmp_path / "sample.jpg"
     Image.new("RGB", (8, 8), color="white").save(image_path, format="JPEG")
     return image_path
+
+
+def _make_description(summary: str):
+    from littlems.models import VisionDescription
+
+    return VisionDescription(
+        summary=summary,
+        baby_present=True,
+        actions=[],
+        expressions=[],
+        scene="room",
+        objects=[],
+        highlights=[],
+        uncertainty=None,
+    )
 
 
 def json_dumps(payload: dict[str, object]) -> str:

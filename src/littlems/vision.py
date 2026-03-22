@@ -5,13 +5,15 @@ import base64
 import io
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 from PIL import Image, ImageOps
 
-from littlems.models import PhotoMetadata, VisionDescription
+from littlems.config import ProviderSettings
+from littlems.models import PhotoMetadata, VisionDescription, VisionProvider, VisionResult
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +21,11 @@ MAX_INLINE_IMAGE_BYTES = 4_000_000
 MAX_INLINE_IMAGE_DIMENSION = 4096
 NORMALIZED_IMAGE_DIMENSION = 1536
 NORMALIZED_IMAGE_QUALITY = 80
+DEFAULT_REQUEST_TIMEOUT = 60.0
 
 
 class OpenAIVisionClient:
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 60.0) -> None:
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = DEFAULT_REQUEST_TIMEOUT) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
@@ -104,6 +107,95 @@ class OpenAIVisionClient:
         content = _extract_content(response.json())
         logger.debug("vision response received image=%s format=%s", image_path, format_name)
         return _parse_description(content)
+
+
+@dataclass(slots=True)
+class _ProviderRuntime:
+    settings: ProviderSettings
+    client: OpenAIVisionClient
+    inflight: int = 0
+
+
+class BalancedVisionClient:
+    def __init__(self, providers: list[ProviderSettings]) -> None:
+        if not providers:
+            raise ValueError("BalancedVisionClient requires at least one provider")
+        self._providers = [
+            _ProviderRuntime(
+                settings=provider,
+                client=OpenAIVisionClient(
+                    base_url=provider.base_url,
+                    api_key=provider.api_key,
+                    model=provider.vision_model,
+                    timeout=provider.timeout or DEFAULT_REQUEST_TIMEOUT,
+                ),
+            )
+            for provider in providers
+        ]
+        self._condition = asyncio.Condition()
+
+    async def describe(self, image_path: Path, metadata: PhotoMetadata) -> VisionResult:
+        attempted: set[int] = set()
+        errors: list[str] = []
+
+        while len(attempted) < len(self._providers):
+            index, runtime = await self._acquire_provider(excluded=attempted)
+            try:
+                description = await runtime.client.describe(image_path, metadata)
+                return VisionResult(
+                    provider=VisionProvider(
+                        name=runtime.settings.name,
+                        base_url=runtime.settings.base_url,
+                        model=runtime.settings.vision_model,
+                    ),
+                    description=description,
+                )
+            except Exception as exc:
+                attempted.add(index)
+                errors.append(f"{runtime.settings.name}: {exc}")
+                logger.warning(
+                    "provider failed image=%s provider=%s error=%s",
+                    image_path,
+                    runtime.settings.name,
+                    exc,
+                )
+            finally:
+                await self._release_provider(index)
+
+        joined_errors = "; ".join(errors)
+        raise RuntimeError(f"All providers failed for {image_path.name}: {joined_errors}")
+
+    async def _acquire_provider(self, *, excluded: set[int]) -> tuple[int, _ProviderRuntime]:
+        async with self._condition:
+            while True:
+                available = [
+                    (index, runtime)
+                    for index, runtime in enumerate(self._providers)
+                    if index not in excluded and runtime.inflight < runtime.settings.max_inflight
+                ]
+                if available:
+                    index, runtime = min(available, key=lambda item: (item[1].inflight, item[0]))
+                    runtime.inflight += 1
+                    logger.debug(
+                        "acquired provider name=%s inflight=%s max_inflight=%s",
+                        runtime.settings.name,
+                        runtime.inflight,
+                        runtime.settings.max_inflight,
+                    )
+                    return index, runtime
+                await self._condition.wait()
+
+    async def _release_provider(self, index: int) -> None:
+        async with self._condition:
+            runtime = self._providers[index]
+            runtime.inflight -= 1
+            logger.debug(
+                "released provider name=%s inflight=%s max_inflight=%s",
+                runtime.settings.name,
+                runtime.inflight,
+                runtime.settings.max_inflight,
+            )
+            self._condition.notify_all()
 
 
 def _build_payload(
@@ -238,88 +330,86 @@ def _extract_content(payload: dict[str, object]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError("Missing choices in model response")
-    message = choices[0].get("message")
+    message = choices[0]
     if not isinstance(message, dict):
         raise ValueError("Missing message in model response")
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content
-    reasoning_content = message.get("reasoning_content")
+    message_payload = message.get("message")
+    if not isinstance(message_payload, dict):
+        raise ValueError("Missing message payload in model response")
+    reasoning_content = message_payload.get("reasoning_content")
     if isinstance(reasoning_content, str) and reasoning_content.strip():
         return reasoning_content
-    if isinstance(content, list):
-        text_chunks = [
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict) and item.get("type") == "text"
-        ]
-        return "".join(text_chunks)
-    raise ValueError("Unsupported model response content")
+    content = message_payload.get("content")
+    if not isinstance(content, str):
+        raise ValueError("Missing content in model response")
+    return content
 
 
 def _parse_description(content: str) -> VisionDescription:
-    parsed = _load_json_object(content)
+    normalized = content.strip()
+    if normalized.startswith("```"):
+        normalized = normalized.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    data = json.loads(normalized)
+    if not isinstance(data, dict):
+        raise ValueError("Model response must be a JSON object")
+
+    summary = _require_string(data, "summary")
+    baby_present = _require_bool(data, "baby_present")
+    actions = _require_string_list(data, "actions")
+    expressions = _require_string_list(data, "expressions")
+    scene = _require_optional_string(data, "scene")
+    objects = _require_string_list(data, "objects")
+    highlights = _require_string_list(data, "highlights")
+    uncertainty = _require_optional_string(data, "uncertainty")
+
     return VisionDescription(
-        summary=_required_string(parsed, "summary"),
-        baby_present=_required_bool(parsed, "baby_present"),
-        actions=_required_string_list(parsed, "actions"),
-        expressions=_required_string_list(parsed, "expressions"),
-        scene=_nullable_string(parsed, "scene"),
-        objects=_required_string_list(parsed, "objects"),
-        highlights=_required_string_list(parsed, "highlights"),
-        uncertainty=_nullable_string(parsed, "uncertainty"),
+        summary=summary,
+        baby_present=baby_present,
+        actions=actions,
+        expressions=expressions,
+        scene=scene,
+        objects=objects,
+        highlights=highlights,
+        uncertainty=uncertainty,
     )
 
 
-def _load_json_object(content: str) -> dict[str, Any]:
-    cleaned = content.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if len(lines) < 3:
-            raise ValueError("Invalid fenced JSON response")
-        cleaned = "\n".join(lines[1:-1]).strip()
-    parsed = json.loads(cleaned)
-    if not isinstance(parsed, dict):
-        raise ValueError("Model response must be a JSON object")
-    return parsed
-
-
-def _required_string(payload: dict[str, Any], key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Field {key!r} must be a non-empty string")
-    return value.strip()
-
-
-def _required_bool(payload: dict[str, Any], key: str) -> bool:
-    value = payload.get(key)
-    if not isinstance(value, bool):
-        raise ValueError(f"Field {key!r} must be a boolean")
+def _require_string(data: dict[str, object], field: str) -> str:
+    value = data.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
     return value
 
 
-def _required_string_list(payload: dict[str, Any], key: str) -> list[str]:
-    value = payload.get(key)
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-        raise ValueError(f"Field {key!r} must be a list of strings")
-    return [item.strip() for item in value]
+def _require_bool(data: dict[str, object], field: str) -> bool:
+    value = data.get(field)
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
 
 
-def _nullable_string(payload: dict[str, Any], key: str) -> str | None:
-    value = payload.get(key)
+def _require_string_list(data: dict[str, object], field: str) -> list[str]:
+    value = data.get(field)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{field} must be a list of strings")
+    return value
+
+
+def _require_optional_string(data: dict[str, object], field: str) -> str | None:
+    value = data.get(field)
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError(f"Field {key!r} must be a string or null")
-    text = value.strip()
-    return text or None
+        raise ValueError(f"{field} must be a string or null")
+    return value
 
 
 def _should_fallback_to_text(response: httpx.Response) -> bool:
-    if response.status_code < 400 or response.status_code >= 500:
+    if response.status_code != 400:
         return False
     body = _response_text_excerpt(response).lower()
-    return "response_format" in body or "json_schema" in body
+    return "response_format" in body and "text" in body
 
 
 def _response_text_excerpt(response: httpx.Response, limit: int = 500) -> str:

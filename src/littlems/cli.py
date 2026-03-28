@@ -17,6 +17,7 @@ from littlems.immich import (
     _date_range_from_records,
     generate_immich_album_report,
     inspect_immich_resume_state,
+    resolve_immich_album_asset_ids,
     upload_immich_descriptions_and_report,
 )
 from littlems.report import generate_report_for_records, load_description_document, select_records_in_range
@@ -223,6 +224,12 @@ def _run_immich_report(args: argparse.Namespace) -> int:
                 if item.get("source_album_name") == args.album_name or item.get("album_name") == args.album_name
             ]
             if not selected_records:
+                selected_records = _select_immich_album_records_from_document(
+                    args=args,
+                    document=document,
+                    all_records=all_records,
+                )
+            if not selected_records:
                 raise SystemExit(f"No records for album found in description document: {args.album_name}")
             resolved_date_from, resolved_date_to = _date_range_from_records(selected_records)
         else:
@@ -282,6 +289,37 @@ def _run_immich_report(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _select_immich_album_records_from_document(
+    *,
+    args: argparse.Namespace,
+    document: dict[str, object],
+    all_records: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    source = document.get("source")
+    if not isinstance(source, dict) or source.get("kind") != "immich":
+        return []
+    if not args.immich_url or not args.album_name:
+        return []
+    api_key = os.environ.get("IMMICH_API_KEY")
+    if not api_key:
+        return []
+    album_asset_ids = asyncio.run(
+        resolve_immich_album_asset_ids(
+            album_name=args.album_name,
+            immich_url=args.immich_url,
+            api_key=api_key,
+        )
+    )
+    if not album_asset_ids:
+        return []
+    selected_records: list[dict[str, object]] = []
+    for item in all_records:
+        source_id = item.get("source_id") or item.get("asset_id")
+        if source_id in album_asset_ids:
+            selected_records.append(item)
+    return selected_records
 
 
 def _run_validate_config(args: argparse.Namespace) -> int:

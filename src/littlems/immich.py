@@ -454,6 +454,19 @@ async def upload_immich_descriptions_and_report(
             await client.update_album_description(album.id, markdown)
 
 
+async def resolve_immich_album_asset_ids(
+    *,
+    album_name: str,
+    immich_url: str,
+    api_key: str,
+    client_transport: httpx.AsyncBaseTransport | None = None,
+) -> set[str]:
+    async with ImmichClient(immich_url, api_key, transport=client_transport) as client:
+        album = await _find_album(client, album_name)
+        assets = await client.search_assets(album_ids=[album.id])
+    return {asset.id for asset in assets}
+
+
 async def _upload_immich_records(*, client: ImmichClient, records: list[dict[str, object]]) -> None:
     for record in records:
         if record.get("source_kind") != "immich":

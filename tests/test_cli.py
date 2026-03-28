@@ -632,6 +632,75 @@ def test_cli_runs_immich_report_from_description_input(monkeypatch, tmp_path: Pa
     assert [record["source_id"] for record in captured["upload"]["records"]] == ["asset-1", "asset-2"]
 
 
+def test_cli_runs_immich_report_from_library_description_input_by_fetching_album_assets(monkeypatch, tmp_path: Path) -> None:
+    output_path = tmp_path / "report.md"
+    description_input_path = tmp_path / "descriptions.json"
+    config_path = _write_provider_config(tmp_path)
+    description_input_path.write_text(
+        json.dumps(
+            {
+                "source": {"kind": "immich", "scope": "library"},
+                "records": [
+                    {"file_name": "a.jpg", "captured_at": "2026-02-10T10:00:00", "summary": "A", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True, "source_kind": "immich", "source_id": "asset-1", "source_album_name": None},
+                    {"file_name": "b.jpg", "captured_at": "2026-02-18T10:00:00", "summary": "B", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True, "source_kind": "immich", "source_id": "asset-2", "source_album_name": None},
+                    {"file_name": "c.jpg", "captured_at": "2026-02-20T10:00:00", "summary": "C", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True, "source_kind": "immich", "source_id": "asset-3", "source_album_name": None},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_generate_report_for_records(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_text("# report\n", encoding="utf-8")
+        return {"markdown": "# report\n"}
+
+    async def fail_generate_immich_album_report(**kwargs: object) -> dict[str, object]:
+        raise AssertionError("generate_immich_album_report should not be called when using --description-input")
+
+    async def fake_resolve_immich_album_asset_ids(**kwargs: object) -> set[str]:
+        captured["resolve"] = kwargs
+        return {"asset-1", "asset-3"}
+
+    monkeypatch.setattr("littlems.cli.generate_report_for_records", fake_generate_report_for_records)
+    monkeypatch.setattr("littlems.cli.generate_immich_album_report", fail_generate_immich_album_report)
+    monkeypatch.setattr("littlems.cli.resolve_immich_album_asset_ids", fake_resolve_immich_album_asset_ids)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+
+    exit_code = main(
+        [
+            "immich",
+            "report",
+            "--description-input",
+            str(description_input_path),
+            "--album-name",
+            "2026-02",
+            "--birth-date",
+            "2025-12-20",
+            "--baby-name",
+            "小满",
+            "--output",
+            str(output_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--provider-config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_path.read_text(encoding="utf-8") == "# report\n"
+    assert captured["resolve"]["album_name"] == "2026-02"
+    assert captured["resolve"]["immich_url"] == "http://immich.lan/api"
+    assert captured["resolve"]["api_key"] == "test-key"
+    assert captured["date_from"] == "2026-02-10"
+    assert captured["date_to"] == "2026-02-20"
+    assert [record["source_id"] for record in captured["records"]] == ["asset-1", "asset-3"]
+
+
 def test_cli_rejects_immich_report_description_input_when_album_and_range_are_both_provided(tmp_path: Path) -> None:
     description_input_path = tmp_path / "descriptions.json"
     description_input_path.write_text(json.dumps({"records": []}), encoding="utf-8")

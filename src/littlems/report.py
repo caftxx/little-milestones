@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import calendar
 import json
 import logging
 import re
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time as dt_time
 from pathlib import Path
 
 import httpx
@@ -17,10 +16,10 @@ from littlems.models import VisionProviderAttempt
 
 logger = logging.getLogger(__name__)
 
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 DEFAULT_REPORT_TIMEOUT = 120.0
-_MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,12 +48,12 @@ class ReportProviderFailure(RuntimeError):
 
 
 _SKILL_RULES = (
-    SkillRule("抓握玩具", ("gripping toy", "holding onto a rattle", "grip", "grasp", "hold a toy")),
-    SkillRule("趴卧", ("lying prone", "on tummy", "prone", "tummy time")),
-    SkillRule("抬头", ("resting chin on hands", "lifting head", "head up", "looking forward")),
-    SkillRule("独坐", ("sitting upright", "sit upright", "sitting unaided")),
-    SkillRule("看向镜头", ("looking at camera", "direct eye contact", "direct gaze", "looking directly at the camera")),
-    SkillRule("与人互动", ("being held", "interaction", "adult hand", "adult holds", "held securely")),
+    SkillRule("抓握玩具", ("gripping toy", "holding onto a rattle", "grip", "grasp", "hold a toy", "抓握", "玩具")),
+    SkillRule("趴卧", ("lying prone", "on tummy", "prone", "tummy time", "趴卧")),
+    SkillRule("抬头", ("resting chin on hands", "lifting head", "head up", "looking forward", "抬头")),
+    SkillRule("独坐", ("sitting upright", "sit upright", "sitting unaided", "独坐")),
+    SkillRule("看向镜头", ("looking at camera", "direct eye contact", "direct gaze", "看向镜头")),
+    SkillRule("与人互动", ("being held", "interaction", "adult hand", "adult holds", "held securely", "互动")),
 )
 
 
@@ -86,117 +85,101 @@ class OpenAITextReportClient:
         return _extract_text_content(response.json()).strip()
 
 
-async def generate_report_files(
-    *,
-    input_path: Path,
-    month: str,
-    birth_date: str,
-    baby_name: str,
-    output_path: Path,
-    settings: ProviderPoolSettings,
-    json_output_path: Path | None = None,
-) -> dict[str, object]:
-    payload = load_describe_document(input_path)
-    month_records = load_month_records(payload, month)
-    age_context = build_age_context(birth_date, month)
-    source_summary = build_report_source_summary(month_records, payload.get("records"), age_context, baby_name=baby_name)
-    result = await generate_markdown_report(source_summary, settings)
-
-    markdown = _normalize_markdown(result.markdown)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(markdown, encoding="utf-8")
-
-    debug_document = {
-        "version": REPORT_VERSION,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "locale": "zh-CN",
-        "month": source_summary["month"],
-        "baby_name": source_summary["baby_name"],
-        "birth_date": age_context["birth_date"],
-        "age_months_start": age_context["age_months_start"],
-        "age_months_end": age_context["age_months_end"],
-        "age_label": age_context["age_label"],
-        "provider_name": result.provider_name,
-        "provider_model": result.provider_model,
-        "source_summary": source_summary,
-        "markdown": markdown,
-    }
-    if json_output_path is not None:
-        json_output_path.parent.mkdir(parents=True, exist_ok=True)
-        json_output_path.write_text(json.dumps(debug_document, ensure_ascii=False, indent=2), encoding="utf-8")
-    return debug_document
-
-
-def load_describe_document(path: Path) -> dict[str, object]:
+def load_description_document(path: Path) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise SystemExit(f"Describe 输出文件不存在: {path}") from exc
+        raise SystemExit(f"Description file not found: {path}") from exc
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"Describe 输出文件不是合法 JSON: {path}: {exc}") from exc
+        raise SystemExit(f"Description file is not valid JSON: {path}: {exc}") from exc
     if not isinstance(payload, dict):
-        raise SystemExit(f"Describe 输出文件必须是 JSON 对象: {path}")
+        raise SystemExit(f"Description file must contain a JSON object: {path}")
     records = payload.get("records")
     if not isinstance(records, list):
-        raise SystemExit("Describe 输出缺少 records 数组")
+        raise SystemExit("Description file is missing the records array")
     return payload
 
 
-def load_month_records(payload: dict[str, object], month: str) -> list[dict[str, object]]:
-    parsed_month = _parse_month(month)
-    records = payload.get("records")
-    assert isinstance(records, list)
-    month_records: list[dict[str, object]] = []
-    for item in records:
-        if not isinstance(item, dict):
+def select_records_in_range(records: list[dict[str, object]], date_from: str, date_to: str) -> list[dict[str, object]]:
+    start, end = parse_date_range(date_from, date_to)
+    selected: list[dict[str, object]] = []
+    for record in records:
+        captured_at = record.get("captured_at")
+        if not isinstance(captured_at, str):
             continue
-        captured_at = item.get("captured_at")
-        if isinstance(captured_at, str) and captured_at[:7] == parsed_month:
-            month_records.append(item)
-    if not month_records:
-        raise SystemExit(f"指定月份没有可用照片记录: {parsed_month}")
-    return sorted(month_records, key=_record_sort_key)
+        parsed = _parse_captured_at(captured_at)
+        if parsed is None:
+            continue
+        if start <= parsed <= end:
+            selected.append(record)
+    if not selected:
+        raise SystemExit(f"No photo records found in the requested date range: {date_from}..{date_to}")
+    return sorted(selected, key=_record_sort_key)
 
 
-def build_age_context(birth_date: str, month: str) -> dict[str, object]:
-    birth = _parse_birth_date(birth_date)
-    parsed_month = _parse_month(month)
-    year, month_value = (int(part) for part in parsed_month.split("-"))
-    month_start = date(year, month_value, 1)
-    month_end = date(year, month_value, calendar.monthrange(year, month_value)[1])
-    if birth > month_end:
-        raise SystemExit(f"出生日期晚于目标月份: {birth_date} > {parsed_month}")
+def load_month_records(payload: dict[str, object], month: str) -> list[dict[str, object]]:
+    if not _MONTH_PATTERN.fullmatch(month):
+        raise SystemExit(f"--month must use YYYY-MM format: {month}")
+    year, month_value = month.split("-")
+    from_date = f"{year}-{month_value}-01"
+    end_day = 31
+    while end_day >= 28:
+        try:
+            to_date = date(int(year), int(month_value), end_day).isoformat()
+            break
+        except ValueError:
+            end_day -= 1
+    else:  # pragma: no cover
+        raise SystemExit(f"--month must use YYYY-MM format: {month}")
+    records = [item for item in payload.get("records", []) if isinstance(item, dict)]
+    return select_records_in_range(records, from_date, to_date)
 
-    age_months_start = _full_months_between(birth, month_start)
-    age_months_end = _full_months_between(birth, month_end)
+
+def parse_date_range(date_from: str, date_to: str) -> tuple[datetime, datetime]:
+    start_date = _parse_date(date_from, "--from")
+    end_date = _parse_date(date_to, "--to")
+    if end_date < start_date:
+        raise SystemExit(f"--to cannot be earlier than --from: {date_to} < {date_from}")
+    return (
+        datetime.combine(start_date, dt_time.min),
+        datetime.combine(end_date, dt_time.max),
+    )
+
+
+def build_age_context(birth_date: str, date_from: str, date_to: str) -> dict[str, object]:
+    birth = _parse_date(birth_date, "--birth-date")
+    start_date = _parse_date(date_from, "--from")
+    end_date = _parse_date(date_to, "--to")
+    if birth > end_date:
+        raise SystemExit(f"Birth date is later than the target date range: {birth_date} > {date_to}")
+    age_months_start = _full_months_between(birth, start_date)
+    age_months_end = _full_months_between(birth, end_date)
     return {
         "birth_date": birth.isoformat(),
         "age_months_start": age_months_start,
         "age_months_end": age_months_end,
-        "age_label": _age_label(age_months_start, age_months_end, birth, month_start, month_end),
+        "age_label": _age_label(age_months_start, age_months_end, birth, start_date, end_date),
     }
 
 
 def build_report_source_summary(
     records: list[dict[str, object]],
-    history: object,
+    history: list[dict[str, object]],
     age_context: dict[str, object],
     *,
     baby_name: str,
 ) -> dict[str, object]:
-    history_records = [item for item in history or [] if isinstance(item, dict)]
     if not records:
-        raise SystemExit("当前月份没有可用于生成月报的照片记录")
+        raise SystemExit("当前时间范围没有可用于生成报告的照片记录")
     normalized_baby_name = baby_name.strip()
     if not normalized_baby_name:
-        raise SystemExit("--baby-name 不能为空")
+        raise SystemExit("--baby-name cannot be empty")
 
-    first_record = records[0]
-    first_captured = str(first_record.get("captured_at"))
-    month = first_captured[:7]
+    first_captured = str(records[0].get("captured_at"))
+    last_captured = str(records[-1].get("captured_at"))
     timeline = [_timeline_item(record) for record in records]
     representative_photos = [_photo_summary(record) for record in _pick_representative_records(records)]
-    candidate_new_skills = _candidate_new_skills(records, history_records, month)
+    candidate_new_skills = _candidate_new_skills(records, history)
     uncertain_items = [
         {
             "captured_at": str(record.get("captured_at")),
@@ -207,7 +190,6 @@ def build_report_source_summary(
         if isinstance(record.get("uncertainty"), str) and str(record.get("uncertainty")).strip()
     ]
     return {
-        "month": month,
         "baby_name": normalized_baby_name,
         "birth_date": age_context["birth_date"],
         "age_months_start": age_context["age_months_start"],
@@ -215,8 +197,10 @@ def build_report_source_summary(
         "age_label": age_context["age_label"],
         "record_count": len(records),
         "date_range": {
-            "first_captured_at": str(records[0].get("captured_at")),
-            "last_captured_at": str(records[-1].get("captured_at")),
+            "from": first_captured[:10],
+            "to": last_captured[:10],
+            "first_captured_at": first_captured,
+            "last_captured_at": last_captured,
         },
         "timeline": timeline,
         "representative_photos": representative_photos,
@@ -269,6 +253,79 @@ async def generate_markdown_report(
     raise ReportProviderFailure(attempts)
 
 
+async def generate_report_files(
+    *,
+    input_path: Path,
+    date_from: str,
+    date_to: str,
+    birth_date: str,
+    baby_name: str,
+    output_path: Path,
+    settings: ProviderPoolSettings,
+    json_output_path: Path | None = None,
+) -> dict[str, object]:
+    payload = load_description_document(input_path)
+    all_records = [item for item in payload.get("records", []) if isinstance(item, dict)]
+    selected_records = select_records_in_range(all_records, date_from, date_to)
+    return await generate_report_for_records(
+        records=selected_records,
+        history_records=all_records,
+        date_from=date_from,
+        date_to=date_to,
+        birth_date=birth_date,
+        baby_name=baby_name,
+        output_path=output_path,
+        settings=settings,
+        json_output_path=json_output_path,
+        source=payload.get("source"),
+    )
+
+
+async def generate_report_for_records(
+    *,
+    records: list[dict[str, object]],
+    history_records: list[dict[str, object]],
+    date_from: str,
+    date_to: str,
+    birth_date: str,
+    baby_name: str,
+    output_path: Path,
+    settings: ProviderPoolSettings,
+    json_output_path: Path | None = None,
+    source: object = None,
+) -> dict[str, object]:
+    age_context = build_age_context(birth_date, date_from, date_to)
+    source_summary = build_report_source_summary(records, history_records, age_context, baby_name=baby_name)
+    result = await generate_markdown_report(source_summary, settings)
+    markdown = _normalize_markdown(result.markdown)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(markdown, encoding="utf-8")
+
+    debug_document = {
+        "version": REPORT_VERSION,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "locale": "zh-CN",
+        "source": source,
+        "date_range": {
+            "from": date_from,
+            "to": date_to,
+        },
+        "baby_name": source_summary["baby_name"],
+        "birth_date": age_context["birth_date"],
+        "age_months_start": age_context["age_months_start"],
+        "age_months_end": age_context["age_months_end"],
+        "age_label": age_context["age_label"],
+        "provider_name": result.provider_name,
+        "provider_model": result.provider_model,
+        "source_summary": source_summary,
+        "markdown": markdown,
+    }
+    if json_output_path is not None:
+        json_output_path.parent.mkdir(parents=True, exist_ok=True)
+        json_output_path.write_text(json.dumps(debug_document, ensure_ascii=False, indent=2), encoding="utf-8")
+    return debug_document
+
+
 def _build_report_payload(source_summary: dict[str, object], model: str) -> dict[str, object]:
     return {
         "model": model,
@@ -283,11 +340,10 @@ def _build_report_payload(source_summary: dict[str, object], model: str) -> dict
                     "保留亲近感和情感温度，但不要直接对宝宝说话，不要写成信件、寄语或家书。"
                     "输出必须是简体中文 Markdown，语气自然、温柔、真诚，不要夸张煽情，不要空泛抒情。"
                     "不要夹带英文标题、英文小结、英文解释、字段翻译或其他英文元话语。"
-                    "重点写这个月的新变化、新掌握的能力、让人想记住的日常瞬间，以及一点轻柔的月末寄语。"
+                    "重点写这个时间范围里的新变化、新掌握的能力、让人想记住的日常瞬间，以及一点轻柔的收束。"
                     "可以结合月龄阶段帮助表达，但不要写成医学建议或发展评估结论。"
                     "只能基于提供的事实素材写作，不要编造素材里没有的时间、地点、人物关系、情节或技能。"
                     "默认优先使用提供的宝宝姓名来指代主角，必要时再用“宝宝”补充，不默认使用“她/他”或“孩子”。"
-                    "宝宝姓名的使用要自然克制：标题里不必强行出现名字，正文前半段自然出现 1 次即可，后文避免反复点名。"
                     "尽量少用抽象赞美词和空泛抒情，多写看得见的动作、表情、姿态、互动和场景细节，让文字有画面感。"
                     "不要机械复述 JSON 字段名，不要出现“根据素材”“根据数据”“从照片中可以看出”“AI”“模型”等元话语。"
                     "禁止出现“这个月想对你说……”“愿你……”“我们看着你……”“亲爱的宝贝……”这类直接对话式表达。"
@@ -296,19 +352,17 @@ def _build_report_payload(source_summary: dict[str, object], model: str) -> dict
             {
                 "role": "user",
                 "content": (
-                    "请根据下面的素材，为宝宝写一篇可以直接阅读的中文月报 Markdown 成品。\n"
+                    "请根据下面的素材，为宝宝写一篇可以直接阅读的中文成长报告 Markdown 成品。\n"
                     "写作要求：\n"
                     "1. 标题自然温柔，不必太正式。\n"
-                    "2. 正文建议 4 到 6 个短段落，读起来像月末写下的成长观察，不像总结报告。\n"
-                    "3. 开头自然带出这个月的月龄阶段和整体变化。\n"
-                    "4. 如果素材里提供了宝宝姓名，正文前半段自然使用 1 次即可；标题里不必强行带名字，后文避免反复重复姓名。\n"
-                    "5. 中间重点写这个月新学会的本领或正在变稳的能力，比如抓握、趴卧、抬头、独坐、互动。\n"
+                    "2. 正文建议 4 到 6 个短段落，读起来像阶段性成长观察，不像总结报告。\n"
+                    "3. 开头自然带出这个时间范围的月龄阶段和整体变化。\n"
+                    "4. 如果素材里提供了宝宝姓名，正文前半段自然使用 1 次即可。\n"
+                    "5. 中间重点写这个阶段新学会的本领或正在变稳的能力。\n"
                     "6. 选 2 到 4 个有画面感的温馨瞬间写进去，但必须来自素材本身。\n"
-                    "7. 少用“很美好”“很治愈”“特别珍贵”这类抽象评价，优先写清楚具体发生了什么。\n"
+                    "7. 少用抽象评价，优先写清楚具体发生了什么。\n"
                     "8. 结尾写一句温柔收束的总结或感受，但不要直接对宝宝说话。\n"
-                    "9. 如果这个月没有明显的新技能，请写成练习和积累中的变化，不要硬凑 milestone。\n"
-                    "10. 尽量避免口号式、模板化、公众号腔、鸡汤腔。\n"
-                    "11. 只把素材里的事实转写成中文正文，不要复述 JSON 字段名，不要插入英文说明或字段翻译。\n\n"
+                    "9. 如果没有明显的新技能，请写成练习和积累中的变化，不要硬凑 milestone。\n"
                     f"素材如下：\n{json.dumps(source_summary, ensure_ascii=False, indent=2)}"
                 ),
             },
@@ -344,29 +398,29 @@ def _response_text_excerpt(response: httpx.Response, limit: int = 500) -> str:
     return text if len(text) <= limit else f"{text[:limit]}..."
 
 
-def _parse_month(value: str) -> str:
-    if not _MONTH_PATTERN.fullmatch(value):
-        raise SystemExit(f"--month 必须是 YYYY-MM 格式: {value}")
-    year, month = value.split("-")
-    try:
-        parsed = datetime(int(year), int(month), 1)
-    except ValueError as exc:
-        raise SystemExit(f"--month 必须是 YYYY-MM 格式: {value}") from exc
-    return parsed.strftime("%Y-%m")
-
-
-def _parse_birth_date(value: str) -> date:
+def _parse_date(value: str, label: str) -> date:
     if not _DATE_PATTERN.fullmatch(value):
-        raise SystemExit(f"--birth-date 必须是 YYYY-MM-DD 格式: {value}")
+        raise SystemExit(f"{label} 必须是 YYYY-MM-DD 格式: {value}")
     try:
         return date.fromisoformat(value)
     except ValueError as exc:
-        raise SystemExit(f"--birth-date 必须是 YYYY-MM-DD 格式: {value}") from exc
+        raise SystemExit(f"{label} 必须是 YYYY-MM-DD 格式: {value}") from exc
+
+
+def _parse_captured_at(value: str) -> datetime | None:
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(UTC).replace(tzinfo=None)
+    return parsed
 
 
 def _record_sort_key(record: dict[str, object]) -> tuple[str, str]:
     captured_at = record.get("captured_at")
-    return (str(captured_at), str(record.get("file_path")))
+    return (str(captured_at), str(record.get("file_path") or record.get("source_id") or record.get("file_name")))
 
 
 def _timeline_item(record: dict[str, object]) -> dict[str, object]:
@@ -414,28 +468,31 @@ def _pick_representative_records(records: list[dict[str, object]]) -> list[dict[
 
 
 def _candidate_new_skills(
-    month_records: list[dict[str, object]],
+    selected_records: list[dict[str, object]],
     history_records: list[dict[str, object]],
-    month: str,
 ) -> list[dict[str, object]]:
+    selected_ids = {
+        str(record.get("source_id") or record.get("file_path") or record.get("file_name"))
+        for record in selected_records
+    }
     skill_history: dict[str, list[dict[str, object]]] = {}
     for record in sorted(history_records, key=_record_sort_key):
-        captured_at = record.get("captured_at")
-        if not isinstance(captured_at, str):
-            continue
         for skill in _matched_skills(record):
             skill_history.setdefault(skill, []).append(record)
 
-    month_paths = {str(record.get("file_path")) for record in month_records}
     candidates: list[dict[str, object]] = []
     for rule in _SKILL_RULES:
         history = skill_history.get(rule.skill_name, [])
         if not history:
             continue
-        first_seen = str(history[0].get("captured_at"))
-        if first_seen[:7] != month:
+        evidence = [
+            record
+            for record in history
+            if str(record.get("source_id") or record.get("file_path") or record.get("file_name")) in selected_ids
+        ]
+        if not evidence:
             continue
-        evidence = [record for record in history if str(record.get("file_path")) in month_paths]
+        first_seen = str(history[0].get("captured_at"))
         candidates.append(
             {
                 "skill_name": rule.skill_name,
@@ -488,8 +545,8 @@ def _full_months_between(birth: date, target: date) -> int:
     return max(0, months)
 
 
-def _age_label(age_months_start: int, age_months_end: int, birth: date, month_start: date, month_end: date) -> str:
-    if birth.year == month_start.year and birth.month == month_start.month:
+def _age_label(age_months_start: int, age_months_end: int, birth: date, start_date: date, end_date: date) -> str:
+    if birth.year == start_date.year and birth.month == start_date.month:
         return "出生当月"
     if age_months_start == age_months_end:
         return f"满{age_months_end}个月"

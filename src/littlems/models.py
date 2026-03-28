@@ -49,3 +49,11 @@ class VisionResult:
     provider_elapsed_ms: int
     provider_attempts: list[VisionProviderAttempt]
     metadata: PhotoMetadata | None = None
+
+
+@dataclass(slots=True)
+class VisionInput:
+    image_name: str
+    mime_type: str
+    image_bytes: bytes
+    metadata: PhotoMetadata

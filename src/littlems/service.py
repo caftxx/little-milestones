@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from littlems.documents import DESCRIPTION_DOCUMENT_VERSION, build_description_document, ensure_record_source_fields
 from littlems.exif import extract_photo_metadata
 from littlems.models import PhotoMetadata, VisionProviderAttempt, VisionResult
 from littlems.scanner import scan_photo_paths
@@ -18,7 +19,7 @@ from littlems.vision import VisionProviderFailure
 logger = logging.getLogger(__name__)
 
 
-OUTPUT_VERSION = 2
+OUTPUT_VERSION = DESCRIPTION_DOCUMENT_VERSION
 ProviderStats = dict[str, int]
 
 
@@ -212,8 +213,8 @@ class PhotoDescriptionService:
             records_by_path = _records_by_path(payload.get("records"))
             failures_by_path = _records_by_path(payload.get("failures"))
             run_state = _mapping(payload.get("run_state"), "run_state")
-            completed_files = {str(item) for item in _list_of_strings(run_state.get("completed_files"), "run_state.completed_files")}
-            failed_files = {str(item) for item in _list_of_strings(run_state.get("failed_files"), "run_state.failed_files")}
+            completed_files = {str(item) for item in _list_of_strings(run_state.get("completed"), "run_state.completed")}
+            failed_files = {str(item) for item in _list_of_strings(run_state.get("failed"), "run_state.failed")}
             completed_files |= set(records_by_path)
             failed_files |= set(failures_by_path)
             provider_metrics_base = self._load_provider_metrics(payload)
@@ -342,36 +343,40 @@ class PhotoDescriptionService:
         total = len(state.paths)
         current_wall_clock_ms = _elapsed_ms_between(state.current_run_started_ns, time.perf_counter_ns())
 
-        return {
-            "version": OUTPUT_VERSION,
-            "status": status,
-            "generated_at": state.generated_at,
-            "updated_at": datetime.now(UTC).isoformat(),
-            "input": {
+        return build_description_document(
+            source={
+                "kind": "local",
                 "directory": str(state.input_dir.resolve()),
                 "recursive": state.recursive,
             },
-            "model": {
+            input_payload={
+                "directory": str(state.input_dir.resolve()),
+                "recursive": state.recursive,
+                "upload_description": False,
+            },
+            model={
                 "provider": "multi_provider_pool",
                 "providers": self._provider_names,
             },
-            "provider_stats": provider_stats,
-            "summary": {
-                "total_files": total,
+            provider_stats=provider_stats,
+            records=records,
+            failures=failures,
+            status=status,
+            generated_at=state.generated_at,
+            run_state={
+                "completed": sorted(state.completed_files),
+                "failed": sorted(state.failed_files),
+                "provider_metrics": provider_metrics,
+            },
+            summary_extra={
+                "total": total,
                 "processed": processed,
                 "failed": failed,
                 "skipped": state.skipped_count,
                 "remaining": max(0, total - processed - failed),
                 "wall_clock_ms": state.prior_wall_clock_ms + current_wall_clock_ms,
             },
-            "records": records,
-            "failures": failures,
-            "run_state": {
-                "completed_files": sorted(state.completed_files),
-                "failed_files": sorted(state.failed_files),
-                "provider_metrics": provider_metrics,
-            },
-        }
+        )
 
     def _build_provider_stats(
         self,
@@ -465,24 +470,34 @@ class PhotoDescriptionService:
             return image_path, _build_record(image_path, metadata, result), None, result.provider_attempts
         except VisionProviderFailure as exc:
             logger.exception("failed to process image=%s", image_path)
-            return image_path, None, {
+            return image_path, None, ensure_record_source_fields({
                 "file_name": image_path.name,
                 "file_path": str(image_path.resolve()),
                 "error": str(exc),
                 "provider_name": exc.last_provider_name,
                 "provider_elapsed_ms": exc.provider_elapsed_ms,
                 "provider_attempts": _serialize_provider_attempts(exc.provider_attempts),
-            }, exc.provider_attempts
+            },
+                source_kind="local",
+                source_id=str(image_path.resolve()),
+                source_path=str(image_path.resolve()),
+                source_uri=image_path.resolve().as_uri(),
+            ), exc.provider_attempts
         except Exception as exc:
             logger.exception("failed to process image=%s", image_path)
-            return image_path, None, {
+            return image_path, None, ensure_record_source_fields({
                 "file_name": image_path.name,
                 "file_path": str(image_path.resolve()),
                 "error": str(exc),
                 "provider_name": None,
                 "provider_elapsed_ms": 0,
                 "provider_attempts": [],
-            }, []
+            },
+                source_kind="local",
+                source_id=str(image_path.resolve()),
+                source_path=str(image_path.resolve()),
+                source_uri=image_path.resolve().as_uri(),
+            ), []
 
 
 def _build_record(
@@ -491,7 +506,8 @@ def _build_record(
     result: VisionResult,
 ) -> dict[str, object]:
     description = result.description
-    return {
+    return ensure_record_source_fields(
+        {
         "file_name": image_path.name,
         "file_path": str(image_path.resolve()),
         "captured_at": metadata.captured_at,
@@ -513,7 +529,12 @@ def _build_record(
         "provider_model": result.provider.model,
         "provider_elapsed_ms": result.provider_elapsed_ms,
         "provider_attempts": _serialize_provider_attempts(result.provider_attempts),
-    }
+        },
+        source_kind="local",
+        source_id=str(image_path.resolve()),
+        source_path=str(image_path.resolve()),
+        source_uri=image_path.resolve().as_uri(),
+    )
 
 
 def _serialize_provider_attempts(attempts: list[VisionProviderAttempt]) -> list[dict[str, object]]:

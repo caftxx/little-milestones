@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 from pathlib import Path
 
@@ -16,6 +17,11 @@ def open_image(image_path: Path) -> Image.Image:
     if image_path.suffix.lower() == ".dng":
         return _open_dng_as_image(image_path)
     return Image.open(image_path)
+
+
+def open_image_bytes(image_bytes: bytes) -> Image.Image:
+    register_optional_image_openers()
+    return Image.open(io.BytesIO(image_bytes))
 
 
 def register_optional_image_openers() -> None:

@@ -71,6 +71,107 @@
 | `albums` | SearchAlbumResponseDto |
 | `assets` | SearchAssetResponseDto |
 
+
+```markdown
+# SearchAlbumResponseDto
+
+## 属性
+
+| 属性 | 类型 | 必填 | 描述 |
+|------|------|------|------|
+| count | Number | ✓ | Number of albums in this page（此页中的相册数量） |
+| facets | SearchFacetResponseDto[] | ✓ | - |
+| items | AlbumResponseDto[] | ✓ | - |
+| total | Number | ✓ | Total number of matching albums（匹配的相册总数） |
+```
+
+```markdown
+# AlbumResponseDto
+
+## 属性列表
+
+| Property | Type | Status | Description |
+|----------|------|--------|-------------|
+| albumName | String | * | Album name |
+| albumThumbnailAssetId | String \| Null | * | Thumbnail asset ID |
+| albumUsers | AlbumUserResponseDto[] | * | - |
+| assetCount | Number | * | Number of assets |
+| assets | AssetResponseDto[] | * | - |
+| contributorCounts | ContributorCountResponseDto[] | - | - |
+| createdAt | DateTime | * | Creation date |
+| description | String | * | Album description |
+| endDate | DateTime | - | End date (latest asset) |
+| hasSharedLink | Boolean | * | Has shared link |
+| id | String | * | Album ID |
+| isActivityEnabled | Boolean | * | Activity feed enabled |
+| lastModifiedAssetTimestamp | DateTime | - | Last modified asset timestamp |
+| order | AssetOrder | - | Asset sort order |
+| owner | UserResponseDto | * | - |
+| ownerId | String | * | Owner user ID |
+| shared | Boolean | * | Is shared album |
+| startDate | DateTime | - | Start date (earliest asset) |
+| updatedAt | DateTime | * | Last update date |
+```
+
+```markdown
+# SearchAssetResponseDto
+type: `object`
+
+## 属性
+
+| 属性名 | 类型 | 必填 | 描述 |
+|--------|------|------|------|
+| count | Number | ✓ | Number of assets in this page |
+| facets | SearchFacetResponseDto[] | ✓ | - |
+| items | AssetResponseDto[] | ✓ | - |
+| nextPage | String \| Null | ✓ | Next page token |
+| total | Number | ✓ | Total number of matching assets |
+```
+
+```markdown
+# AssetResponseDto
+
+对象模型属性列表：
+
+| 属性 | 类型 | 状态 | 描述 |
+|------|------|------|------|
+| checksum* | String | | Base64 encoded SHA1 hash |
+| createdAt* | DateTime | | The UTC timestamp when the asset was originally uploaded to Immich. |
+| deviceAssetId* | String | | Device asset ID |
+| deviceId* | String | | Device ID |
+| duplicateId | String \| Null | | Duplicate group ID |
+| duration* | String | | Video duration (for videos) |
+| exifInfo | ExifResponseDto | | - |
+| fileCreatedAt* | DateTime | | The actual UTC timestamp when the file was created/captured, preserving timezone information. This is the authoritative timestamp for chronological sorting within timeline groups. Combined with timezone data, this can be used to determine the exact moment the photo was taken. |
+| fileModifiedAt* | DateTime | | The UTC timestamp when the file was last modified on the filesystem. This reflects the last time the physical file was changed, which may be different from when the photo was originally taken. |
+| hasMetadata* | Boolean | | Whether asset has metadata |
+| height* | Number \| Null | | Asset height |
+| id* | String | | Asset ID |
+| isArchived* | Boolean | | Is archived |
+| isEdited* | Boolean | Beta | Is edited |
+| isFavorite* | Boolean | | Is favorite |
+| isOffline* | Boolean | | Is offline |
+| isTrashed* | Boolean | | Is trashed |
+| libraryId | UUID \| Null | Deprecated | Library ID |
+| livePhotoVideoId | String \| Null | | Live photo video ID |
+| localDateTime* | DateTime | | The local date and time when the photo/video was taken, derived from EXIF metadata. This represents the photographer's local time regardless of timezone, stored as a timezone-agnostic timestamp. Used for timeline grouping by "local" days and months. |
+| originalFileName* | String | | Original file name |
+| originalMimeType | String | | Original MIME type |
+| originalPath* | String | | Original file path |
+| owner | UserResponseDto | | - |
+| ownerId* | String | | Owner user ID |
+| people | PersonWithFacesResponseDto[] | | - |
+| resized | Boolean | Deprecated | Is resized |
+| stack | AssetStackResponseDto \| Null | | - |
+| tags | TagResponseDto[] | | - |
+| thumbhash* | String \| Null | | Thumbhash for thumbnail generation (base64) also used as the c query param for thumbnail cache busting. |
+| type* | AssetTypeEnum | | Asset type |
+| unassignedFaces | AssetFaceWithoutPersonResponseDto[] | | - |
+| updatedAt* | DateTime | | The UTC timestamp when the asset record was last updated in the database. This is automatically maintained by the database and reflects when any field in the asset was last modified. |
+| visibility* | AssetVisibility | | Asset visibility |
+| width* | Number \| Null | | Asset width |
+```
+
 ---
 
 ## 历史版本

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import UnidentifiedImageError
 
-from littlems.imaging import open_image
+from littlems.imaging import open_image, open_image_bytes
 from littlems.models import PhotoMetadata
 
 
@@ -22,48 +22,65 @@ _FILENAME_DATETIME_PATTERN = re.compile(
 def extract_photo_metadata(image_path: Path) -> PhotoMetadata:
     try:
         with open_image(image_path) as image:
-            exif = image.getexif()
-            exif_ifd = exif.get_ifd(34665) if hasattr(exif, "get_ifd") else {}
-            gps_ifd = exif.get_ifd(34853) if hasattr(exif, "get_ifd") else {}
-
-            metadata = PhotoMetadata()
-
-            captured_at = exif_ifd.get(36867) or exif.get(306)
-            if captured_at:
-                metadata.captured_at = str(captured_at).replace(":", "-", 2).replace(" ", "T", 1)
-                metadata.metadata_source["captured_at"] = "exif"
-
-            timezone = exif_ifd.get(36881)
-            if timezone:
-                metadata.timezone = str(timezone)
-                metadata.metadata_source["timezone"] = "exif"
-
+            metadata = _extract_metadata_from_image(image)
             _apply_datetime_fallbacks(metadata, image_path)
-
-            make = exif.get(271)
-            model = exif.get(272)
-            if make or model:
-                metadata.device = {
-                    "make": str(make or "").strip(),
-                    "model": str(model or "").strip(),
-                }
-                metadata.metadata_source["device"] = "exif"
-
-            gps = _parse_gps(gps_ifd)
-            if gps is None:
-                metadata.gps = DEFAULT_GPS.copy()
-                metadata.metadata_source["gps"] = "default_gps"
-                logger.debug("gps missing in exif, using default gps image=%s", image_path)
-            else:
-                metadata.gps = gps
-                metadata.metadata_source["gps"] = "exif"
-                logger.debug("gps extracted from exif image=%s gps=%s", image_path, gps)
-
             logger.debug("exif extraction complete image=%s metadata_source=%s", image_path, metadata.metadata_source)
             return metadata
     except UnidentifiedImageError as exc:
         logger.warning("cannot decode image=%s", image_path)
         raise RuntimeError("cannot decode") from exc
+
+
+def extract_photo_metadata_from_bytes(image_bytes: bytes) -> PhotoMetadata:
+    try:
+        with open_image_bytes(image_bytes) as image:
+            metadata = _extract_metadata_from_image(image)
+            if metadata.gps is None:
+                metadata.gps = DEFAULT_GPS.copy()
+                metadata.metadata_source["gps"] = "default_gps"
+            return metadata
+    except UnidentifiedImageError as exc:
+        logger.warning("cannot decode image bytes")
+        raise RuntimeError("cannot decode") from exc
+
+
+def _extract_metadata_from_image(image: object) -> PhotoMetadata:
+    exif = image.getexif()
+    exif_ifd = exif.get_ifd(34665) if hasattr(exif, "get_ifd") else {}
+    gps_ifd = exif.get_ifd(34853) if hasattr(exif, "get_ifd") else {}
+
+    metadata = PhotoMetadata()
+
+    captured_at = exif_ifd.get(36867) or exif.get(306)
+    if captured_at:
+        metadata.captured_at = str(captured_at).replace(":", "-", 2).replace(" ", "T", 1)
+        metadata.metadata_source["captured_at"] = "exif"
+
+    timezone = exif_ifd.get(36881)
+    if timezone:
+        metadata.timezone = str(timezone)
+        metadata.metadata_source["timezone"] = "exif"
+
+    make = exif.get(271)
+    model = exif.get(272)
+    if make or model:
+        metadata.device = {
+            "make": str(make or "").strip(),
+            "model": str(model or "").strip(),
+        }
+        metadata.metadata_source["device"] = "exif"
+
+    gps = _parse_gps(gps_ifd)
+    if gps is None:
+        metadata.gps = DEFAULT_GPS.copy()
+        metadata.metadata_source["gps"] = "default_gps"
+        logger.debug("gps missing in exif, using default gps")
+    else:
+        metadata.gps = gps
+        metadata.metadata_source["gps"] = "exif"
+        logger.debug("gps extracted from exif gps=%s", gps)
+
+    return metadata
 
 
 def _apply_datetime_fallbacks(metadata: PhotoMetadata, image_path: Path) -> None:

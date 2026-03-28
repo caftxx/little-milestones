@@ -14,11 +14,13 @@ from littlems.config import ProviderSettings
 from littlems.models import PhotoMetadata
 from littlems.vision import (
     MAX_INLINE_IMAGE_BYTES,
+    MAX_MODEL_IMAGE_BYTES,
     BalancedVisionClient,
     OpenAIVisionClient,
     _encode_image_as_data_url,
     _parse_description,
     _prepare_image_bytes,
+    _prepare_inline_image_bytes,
 )
 
 
@@ -434,11 +436,12 @@ def test_prepare_image_bytes_keeps_small_original_image(tmp_path: Path) -> None:
 
     assert mime_type == "image/jpeg"
     assert image_bytes == image_path.read_bytes()
+    assert len(image_bytes) <= MAX_MODEL_IMAGE_BYTES
 
 
 def test_prepare_image_bytes_normalizes_large_image(tmp_path: Path) -> None:
     image_path = tmp_path / "large.jpg"
-    Image.new("RGB", (5000, 4000), color="white").save(
+    Image.effect_noise((5000, 4000), 100.0).convert("RGB").save(
         image_path,
         format="JPEG",
         quality=100,
@@ -449,6 +452,25 @@ def test_prepare_image_bytes_normalizes_large_image(tmp_path: Path) -> None:
     assert mime_type == "image/jpeg"
     assert len(image_bytes) < image_path.stat().st_size
     assert image_bytes != image_path.read_bytes()
+    assert len(image_bytes) <= MAX_MODEL_IMAGE_BYTES
+
+
+def test_prepare_inline_image_bytes_normalizes_large_image_under_budget(tmp_path: Path) -> None:
+    image_path = tmp_path / "inline-large.jpg"
+    Image.effect_noise((5000, 4000), 100.0).convert("RGB").save(
+        image_path,
+        format="JPEG",
+        quality=100,
+    )
+
+    mime_type, image_bytes = _prepare_inline_image_bytes(
+        image_bytes=image_path.read_bytes(),
+        mime_type="image/jpeg",
+        image_name=image_path.name,
+    )
+
+    assert mime_type == "image/jpeg"
+    assert len(image_bytes) <= MAX_MODEL_IMAGE_BYTES
 
 
 def test_prepare_image_bytes_normalizes_heif_into_jpeg(monkeypatch, tmp_path: Path) -> None:

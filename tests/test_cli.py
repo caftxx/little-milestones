@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 
 from littlems.cli import build_service, main
 from littlems.config import ProviderPoolSettings, ProviderSettings
-from littlems.immich import default_album_sync_output_path, default_asset_sync_output_path
 from littlems.service import ResumeState
 
 
-def test_cli_runs_describe_command(monkeypatch, tmp_path: Path) -> None:
+def test_cli_runs_local_describe_command(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     photos = tmp_path / "photos"
     photos.mkdir()
@@ -21,102 +18,6 @@ def test_cli_runs_describe_command(monkeypatch, tmp_path: Path) -> None:
     config_path = _write_provider_config(tmp_path)
 
     captured: dict[str, object] = {}
-    progress_updates: list[tuple[int, int, str]] = []
-
-    class StubProgressBar:
-        def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
-            self.total = total
-            self.desc = desc
-            self.unit = unit
-            self.dynamic_ncols = dynamic_ncols
-            self.n = 0
-
-        def __enter__(self) -> StubProgressBar:
-            return self
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            return None
-
-        def set_postfix_str(self, value: str) -> None:
-            progress_updates.append((self.n, self.total, value))
-
-        def update(self, delta: int) -> None:
-            self.n += delta
-
-    class StubService:
-        async def describe_to_file(
-            self,
-            input_dir: Path,
-            output_file: Path,
-            recursive: bool,
-            progress_callback: object = None,
-        ) -> None:
-            captured["input_dir"] = input_dir
-            captured["output_file"] = output_file
-            captured["recursive"] = recursive
-            if progress_callback is not None:
-                progress_callback(1, 2, photos / "a.jpg")
-                progress_callback(2, 2, photos / "b.jpg")
-            output_file.write_text(json.dumps({"ok": True}), encoding="utf-8")
-
-    captured_settings: dict[str, ProviderPoolSettings] = {}
-
-    def stub_build_service(settings: ProviderPoolSettings, *, max_workers: int) -> StubService:
-        captured_settings["settings"] = settings
-        captured["max_workers"] = max_workers
-        return StubService()
-
-    monkeypatch.setattr("littlems.cli.build_service", stub_build_service)
-    monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
-
-    exit_code = main(
-        [
-            "describe",
-            "--input",
-            str(photos),
-            "--output",
-            str(output_path),
-            "--provider-config",
-            str(config_path),
-        ]
-    )
-
-    assert exit_code == 0
-    assert captured == {
-        "input_dir": photos,
-        "output_file": output_path,
-        "recursive": True,
-        "max_workers": 16,
-    }
-    assert captured_settings["settings"] == ProviderPoolSettings(
-        providers=[
-            ProviderSettings(
-                name="fast-a",
-                base_url="http://a.example/v1",
-                api_key="key-a",
-                vision_model="model-a",
-                max_inflight=2,
-                timeout=None,
-            )
-        ]
-    )
-    assert json.loads(output_path.read_text(encoding="utf-8")) == {"ok": True}
-    assert progress_updates == []
-    assert not any(
-        isinstance(handler, logging.StreamHandler)
-        and getattr(handler, "stream", None) in {sys.stdout, sys.stderr}
-        for handler in logging.getLogger().handlers
-    )
-    assert (tmp_path / "log" / "littlems.log").exists()
-
-
-def test_cli_log_path_overrides_default(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    photos = tmp_path / "photos"
-    photos.mkdir()
-    output_path = tmp_path / "descriptions.json"
-    log_path = tmp_path / "custom" / "cli.log"
-    config_path = _write_provider_config(tmp_path)
 
     class StubProgressBar:
         def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
@@ -124,78 +25,12 @@ def test_cli_log_path_overrides_default(monkeypatch, tmp_path: Path) -> None:
             self.n = 0
 
         def __enter__(self) -> StubProgressBar:
-            return self
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            return None
-
-        def set_postfix_str(self, value: str) -> None:
-            return None
-
-        def update(self, delta: int) -> None:
-            self.n += delta
-
-    class StubService:
-        async def describe_to_file(
-            self,
-            input_dir: Path,
-            output_file: Path,
-            recursive: bool,
-            progress_callback: object = None,
-        ) -> None:
-            output_file.write_text(json.dumps({"ok": True}), encoding="utf-8")
-
-    monkeypatch.setattr("littlems.cli.build_service", lambda settings, *, max_workers: StubService())
-    monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
-
-    exit_code = main(
-        [
-            "describe",
-            "--input",
-            str(photos),
-            "--output",
-            str(output_path),
-            "--provider-config",
-            str(config_path),
-            "--log-path",
-            str(log_path),
-        ]
-    )
-
-    assert exit_code == 0
-    assert log_path.exists()
-    assert not (tmp_path / "log" / "littlems.log").exists()
-
-
-def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    photos = tmp_path / "photos"
-    photos.mkdir()
-    output_path = tmp_path / "descriptions.json"
-    config_path = _write_provider_config(tmp_path)
-
-    observed: dict[str, object] = {}
-
-    class StubProgressBar:
-        def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
-            self.total = total
-            self.desc = desc
-            self.unit = unit
-            self.dynamic_ncols = dynamic_ncols
-            self.n = 0
-            self.refreshed = False
-
-        def __enter__(self) -> StubProgressBar:
-            observed["progress"] = self
             return self
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
             return None
 
         def refresh(self) -> None:
-            self.refreshed = True
-
-        def set_postfix_str(self, value: str) -> None:
             return None
 
         def update(self, delta: int) -> None:
@@ -203,8 +38,8 @@ def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> Non
 
     class StubService:
         def inspect_resume_state(self, input_dir: Path, output_file: Path, recursive: bool = False) -> ResumeState:
-            observed["inspect"] = (input_dir, output_file, recursive)
-            return ResumeState(total_files=8, skipped=3, failed_to_retry=2, pending=5)
+            captured["inspect"] = (input_dir, output_file, recursive)
+            return ResumeState(total_files=2, skipped=0, failed_to_retry=0, pending=2)
 
         async def describe_to_file(
             self,
@@ -213,15 +48,18 @@ def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> Non
             recursive: bool,
             progress_callback: object = None,
         ) -> None:
-            observed["describe"] = (input_dir, output_file, recursive)
+            captured["describe"] = (input_dir, output_file, recursive)
             if progress_callback is not None:
-                progress_callback(4, 8, photos / "d.jpg")
+                progress_callback(1, 2, photos / "a.jpg")
+                progress_callback(2, 2, photos / "b.jpg")
+            output_file.write_text(json.dumps({"ok": True}), encoding="utf-8")
 
     monkeypatch.setattr("littlems.cli.build_service", lambda settings, *, max_workers: StubService())
     monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
 
     exit_code = main(
         [
+            "local",
             "describe",
             "--input",
             str(photos),
@@ -233,11 +71,13 @@ def test_cli_sets_progress_from_resume_state(monkeypatch, tmp_path: Path) -> Non
     )
 
     assert exit_code == 0
-    progress = observed["progress"]
-    assert isinstance(progress, StubProgressBar)
-    assert progress.total == 8
-    assert progress.refreshed is True
-    assert progress.n == 4
+    assert captured["describe"] == (photos, output_path, True)
+    assert json.loads(output_path.read_text(encoding="utf-8")) == {"ok": True}
+    assert (tmp_path / "log" / "littlems.log").exists()
+    assert not any(
+        isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) in {sys.stdout, sys.stderr}
+        for handler in logging.getLogger().handlers
+    )
 
 
 def test_build_service_defaults_max_workers_to_16() -> None:
@@ -248,16 +88,256 @@ def test_build_service_defaults_max_workers_to_16() -> None:
             ]
         )
     )
-
     assert service._max_workers == 16
 
 
-def test_cli_passes_custom_max_workers(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
+def test_cli_runs_local_report_command(monkeypatch, tmp_path: Path) -> None:
     photos = tmp_path / "photos"
     photos.mkdir()
+    output_path = tmp_path / "report.md"
+    description_output_path = tmp_path / "descriptions.json"
+    json_output_path = tmp_path / "report.json"
+    config_path = _write_provider_config(tmp_path)
+
+    document = {
+        "source": {"kind": "local", "directory": str(photos)},
+        "records": [
+            {"file_name": "a.jpg", "captured_at": "2026-03-10T10:00:00", "summary": "A", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True},
+            {"file_name": "b.jpg", "captured_at": "2026-03-18T10:00:00", "summary": "B", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True},
+        ],
+    }
+
+    class StubService:
+        async def describe_directory(self, input_dir: Path, recursive: bool = False, progress_callback: object = None) -> dict[str, object]:
+            assert input_dir == photos
+            assert recursive is True
+            assert progress_callback is None
+            return document
+
+    captured: dict[str, object] = {}
+
+    async def fake_generate_report_for_records(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_text("# report\n", encoding="utf-8")
+        json_path = kwargs["json_output_path"]
+        assert isinstance(json_path, Path)
+        json_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+        return {"markdown": "# report\n"}
+
+    monkeypatch.setattr("littlems.cli.build_service", lambda settings, *, max_workers: StubService())
+    monkeypatch.setattr("littlems.cli.generate_report_for_records", fake_generate_report_for_records)
+
+    exit_code = main(
+        [
+            "local",
+            "report",
+            "--input",
+            str(photos),
+            "--from",
+            "2026-03-01",
+            "--to",
+            "2026-03-31",
+            "--birth-date",
+            "2025-12-20",
+            "--baby-name",
+            "小满",
+            "--output",
+            str(output_path),
+            "--json-output",
+            str(json_output_path),
+            "--description-output",
+            str(description_output_path),
+            "--provider-config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_path.read_text(encoding="utf-8") == "# report\n"
+    assert json.loads(description_output_path.read_text(encoding="utf-8"))["source"]["kind"] == "local"
+    assert captured["date_from"] == "2026-03-01"
+    assert captured["date_to"] == "2026-03-31"
+    assert len(captured["records"]) == 2
+
+
+def test_cli_runs_local_report_from_description_input(monkeypatch, tmp_path: Path) -> None:
+    output_path = tmp_path / "report.md"
+    description_input_path = tmp_path / "descriptions.json"
+    description_output_path = tmp_path / "descriptions-copy.json"
+    json_output_path = tmp_path / "report.json"
+    config_path = _write_provider_config(tmp_path)
+    description_input_path.write_text(
+        json.dumps(
+            {
+                "source": {"kind": "local", "directory": str(tmp_path / "photos")},
+                "records": [
+                    {"file_name": "a.jpg", "captured_at": "2026-03-10T10:00:00", "summary": "A", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True},
+                    {"file_name": "b.jpg", "captured_at": "2026-03-18T10:00:00", "summary": "B", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_describe_directory(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("describe_directory should not be called when using --description-input")
+
+    class StubService:
+        describe_directory = fail_describe_directory
+
+    captured: dict[str, object] = {}
+
+    async def fake_generate_report_for_records(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_text("# report\n", encoding="utf-8")
+        return {"markdown": "# report\n"}
+
+    monkeypatch.setattr("littlems.cli.build_service", lambda settings, *, max_workers: StubService())
+    monkeypatch.setattr("littlems.cli.generate_report_for_records", fake_generate_report_for_records)
+
+    exit_code = main(
+        [
+            "local",
+            "report",
+            "--description-input",
+            str(description_input_path),
+            "--from",
+            "2026-03-01",
+            "--to",
+            "2026-03-31",
+            "--birth-date",
+            "2025-12-20",
+            "--baby-name",
+            "小满",
+            "--output",
+            str(output_path),
+            "--json-output",
+            str(json_output_path),
+            "--description-output",
+            str(description_output_path),
+            "--provider-config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_path.read_text(encoding="utf-8") == "# report\n"
+    assert json.loads(description_output_path.read_text(encoding="utf-8"))["source"]["kind"] == "local"
+    assert len(captured["records"]) == 2
+
+
+def test_cli_rejects_local_report_when_description_input_and_input_are_both_provided(tmp_path: Path) -> None:
+    description_input_path = tmp_path / "descriptions.json"
+    description_input_path.write_text(json.dumps({"records": []}), encoding="utf-8")
+    config_path = _write_provider_config(tmp_path)
+
+    try:
+        main(
+            [
+                "local",
+                "report",
+                "--description-input",
+                str(description_input_path),
+                "--input",
+                str(tmp_path / "photos"),
+                "--from",
+                "2026-03-01",
+                "--to",
+                "2026-03-31",
+                "--birth-date",
+                "2025-12-20",
+                "--baby-name",
+                "小满",
+                "--output",
+                str(tmp_path / "report.md"),
+                "--provider-config",
+                str(config_path),
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == "local report cannot use --description-input and --input together"
+    else:
+        raise AssertionError("Expected local report selection validation to fail")
+
+
+def test_cli_runs_immich_describe_command(monkeypatch, tmp_path: Path) -> None:
     output_path = tmp_path / "descriptions.json"
     config_path = _write_provider_config(tmp_path)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+
+    captured: dict[str, object] = {}
+
+    class StubProgressBar:
+        def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
+            captured["progress_total"] = total
+            self.total = total
+            self.n = 0
+
+        def __enter__(self) -> StubProgressBar:
+            captured["progress"] = self
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def refresh(self) -> None:
+            captured["refreshed"] = True
+
+        def update(self, delta: int) -> None:
+            self.n += delta
+
+    async def fake_inspect_immich_resume_state(**kwargs: object):
+        captured["inspect"] = kwargs
+        from littlems.immich import ImmichResumeState
+
+        return ImmichResumeState(total_assets=3, skipped=1, failed_to_retry=1, pending=2)
+
+    async def fake_describe_immich_album_to_file(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_text(json.dumps({"ok": True}), encoding="utf-8")
+        progress_callback = kwargs["progress_callback"]
+        progress_callback(2, 3, object())
+        progress_callback(3, 3, object())
+        return {"ok": True}
+
+    monkeypatch.setattr("littlems.cli.inspect_immich_resume_state", fake_inspect_immich_resume_state)
+    monkeypatch.setattr("littlems.cli.describe_immich_album_to_file", fake_describe_immich_album_to_file)
+    monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
+
+    exit_code = main(
+        [
+            "immich",
+            "describe",
+            "--album-name",
+            "宝宝成长 2026-03",
+            "--output",
+            str(output_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--provider-config",
+            str(config_path),
+            "--upload-description",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["album_name"] == "宝宝成长 2026-03"
+    assert captured["immich_url"] == "http://immich.lan/api"
+    assert captured["api_key"] == "test-key"
+    assert captured["upload_description"] is True
+    assert captured["max_workers"] == 16
+    assert captured["progress_total"] == 3
+    assert captured["refreshed"] is True
+    progress = captured["progress"]
+    assert isinstance(progress, StubProgressBar)
+    assert progress.n == 3
+
+
+def test_cli_runs_immich_describe_without_album_name(monkeypatch, tmp_path: Path) -> None:
+    output_path = tmp_path / "descriptions.json"
+    config_path = _write_provider_config(tmp_path)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
 
     captured: dict[str, object] = {}
 
@@ -275,651 +355,356 @@ def test_cli_passes_custom_max_workers(monkeypatch, tmp_path: Path) -> None:
         def update(self, delta: int) -> None:
             self.n += delta
 
-    class StubService:
-        async def describe_to_file(
-            self,
-            input_dir: Path,
-            output_file: Path,
-            recursive: bool,
-            progress_callback: object = None,
-        ) -> None:
-            del input_dir, recursive, progress_callback
-            output_file.write_text(json.dumps({"ok": True}), encoding="utf-8")
+    async def fake_inspect_immich_resume_state(**kwargs: object):
+        captured["inspect"] = kwargs
+        from littlems.immich import ImmichResumeState
 
-    def stub_build_service(settings: ProviderPoolSettings, *, max_workers: int) -> StubService:
-        captured["providers"] = [provider.name for provider in settings.providers]
-        captured["max_workers"] = max_workers
-        return StubService()
+        return ImmichResumeState(total_assets=1, skipped=0, failed_to_retry=0, pending=1)
 
-    monkeypatch.setattr("littlems.cli.build_service", stub_build_service)
+    async def fake_describe_immich_album_to_file(**kwargs: object) -> dict[str, object]:
+        captured["describe"] = kwargs
+        return {"ok": True}
+
+    monkeypatch.setattr("littlems.cli.inspect_immich_resume_state", fake_inspect_immich_resume_state)
+    monkeypatch.setattr("littlems.cli.describe_immich_album_to_file", fake_describe_immich_album_to_file)
     monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
 
     exit_code = main(
         [
+            "immich",
             "describe",
-            "--input",
-            str(photos),
             "--output",
             str(output_path),
+            "--immich-url",
+            "http://immich.lan/api",
             "--provider-config",
             str(config_path),
-            "--max-workers",
-            "7",
         ]
     )
 
     assert exit_code == 0
-    assert captured == {"providers": ["fast-a"], "max_workers": 7}
+    assert captured["inspect"]["album_name"] is None
+    assert captured["describe"]["album_name"] is None
 
 
-def test_cli_rejects_invalid_max_workers(tmp_path: Path) -> None:
-    photos = tmp_path / "photos"
-    photos.mkdir()
-    output_path = tmp_path / "descriptions.json"
-    config_path = _write_provider_config(tmp_path)
-
-    try:
-        main(
-            [
-                "describe",
-                "--input",
-                str(photos),
-                "--output",
-                str(output_path),
-                "--provider-config",
-                str(config_path),
-                "--max-workers",
-                "0",
-            ]
-        )
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected CLI to reject non-positive --max-workers")
-
-
-def test_cli_requires_provider_config(tmp_path: Path) -> None:
-    photos = tmp_path / "photos"
-    photos.mkdir()
-    output_path = tmp_path / "descriptions.json"
-
-    try:
-        main(["describe", "--input", str(photos), "--output", str(output_path)])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected CLI to require --provider-config")
-
-
-def test_cli_rejects_missing_provider_config_file(tmp_path: Path) -> None:
-    photos = tmp_path / "photos"
-    photos.mkdir()
-    output_path = tmp_path / "descriptions.json"
-    missing_config = tmp_path / "missing.json"
-
-    try:
-        main(
-            [
-                "describe",
-                "--input",
-                str(photos),
-                "--output",
-                str(output_path),
-                "--provider-config",
-                str(missing_config),
-            ]
-        )
-    except SystemExit as exc:
-        assert exc.code == f"Provider config file not found: {missing_config}"
-    else:
-        raise AssertionError("Expected CLI to fail when provider config is missing")
-
-
-def test_validate_config_succeeds_for_valid_provider_config(tmp_path: Path) -> None:
-    config_path = _write_provider_config(tmp_path)
-
-    exit_code = main(["validate-config", "--provider-config", str(config_path)])
-
-    assert exit_code == 0
-
-
-def test_validate_config_prints_probe_summary(monkeypatch, tmp_path: Path, capsys) -> None:
-    config_path = _write_provider_config(tmp_path)
-
-    async def fake_probe(settings: ProviderPoolSettings) -> list[dict[str, object]]:
-        assert [provider.name for provider in settings.providers] == ["fast-a"]
-        return [
-            {
-                "name": "fast-a",
-                "base_url": "http://a.example/v1",
-                "model": "model-a",
-                "ok": True,
-                "error_kind": None,
-                "error": None,
-            }
-        ]
-
-    monkeypatch.setattr("littlems.cli._probe_provider_pool", fake_probe)
-
-    exit_code = main(["validate-config", "--provider-config", str(config_path), "--probe"])
-
-    assert exit_code == 0
-    assert "OK   fast-a  http://a.example/v1  model=model-a" in capsys.readouterr().out
-
-
-def test_validate_config_fails_for_invalid_provider_config(tmp_path: Path) -> None:
-    config_path = _write_provider_config(tmp_path, payload={"providers": []})
-
-    try:
-        main(["validate-config", "--provider-config", str(config_path)])
-    except SystemExit as exc:
-        assert exc.code == "Provider config must contain a non-empty 'providers' array"
-    else:
-        raise AssertionError("Expected validate-config to fail for invalid config")
-
-
-def test_validate_config_with_probe_fails_after_printing_all_failures(monkeypatch, tmp_path: Path, capsys) -> None:
-    config_path = _write_provider_config(tmp_path)
-
-    async def fake_probe(settings: ProviderPoolSettings) -> list[dict[str, object]]:
-        del settings
-        return [
-            {
-                "name": "fast-a",
-                "base_url": "http://a.example/v1",
-                "model": "model-a",
-                "ok": False,
-                "error_kind": "timeout",
-                "error": "timeout",
-            },
-            {
-                "name": "slow-b",
-                "base_url": "http://b.example/v1",
-                "model": "model-b",
-                "ok": False,
-                "error_kind": "unauthorized",
-                "error": "HTTP 401 unauthorized",
-            },
-        ]
-
-    monkeypatch.setattr("littlems.cli._probe_provider_pool", fake_probe)
-
-    try:
-        main(["validate-config", "--provider-config", str(config_path), "--probe"])
-    except SystemExit as exc:
-        assert exc.code == "Provider probe failed for: fast-a, slow-b"
-    else:
-        raise AssertionError("Expected validate-config --probe to fail when probe fails")
-    output = capsys.readouterr().out
-    assert "FAIL fast-a  http://a.example/v1  model=model-a  kind=timeout  error=timeout" in output
-    assert (
-        "FAIL slow-b  http://b.example/v1  model=model-b  kind=unauthorized  error=HTTP 401 unauthorized"
-        in output
-    )
-
-
-def test_cli_runs_generate_report_command(monkeypatch, tmp_path: Path) -> None:
-    input_path = tmp_path / "descriptions.json"
+def test_cli_runs_immich_report_command(monkeypatch, tmp_path: Path) -> None:
     output_path = tmp_path / "report.md"
+    description_output_path = tmp_path / "descriptions.json"
     json_output_path = tmp_path / "report.json"
     config_path = _write_provider_config(tmp_path)
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
 
     captured: dict[str, object] = {}
 
-    async def fake_generate_report_files(
-        *,
-        input_path: Path,
-        month: str,
-        birth_date: str,
-        baby_name: str,
-        output_path: Path,
-        settings: ProviderPoolSettings,
-        json_output_path: Path | None = None,
-    ) -> dict[str, object]:
-        captured["input_path"] = input_path
-        captured["month"] = month
-        captured["birth_date"] = birth_date
-        captured["baby_name"] = baby_name
-        captured["output_path"] = output_path
-        captured["providers"] = [provider.name for provider in settings.providers]
-        captured["json_output_path"] = json_output_path
-        output_path.write_text("# report\n", encoding="utf-8")
-        if json_output_path is not None:
-            json_output_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
-        return {"ok": True}
+    async def fake_generate_immich_album_report(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_text("# report\n", encoding="utf-8")
+        return {"markdown": "# report\n"}
 
-    monkeypatch.setattr("littlems.cli.generate_report_files", fake_generate_report_files)
+    monkeypatch.setattr("littlems.cli.generate_immich_album_report", fake_generate_immich_album_report)
 
     exit_code = main(
         [
-            "generate-report",
-            "--input",
-            str(input_path),
-            "--month",
-            "2026-03",
+            "immich",
+            "report",
+            "--album-name",
+            "宝宝成长 2026-03",
             "--birth-date",
             "2025-12-20",
             "--baby-name",
             "小满",
             "--output",
             str(output_path),
-            "--provider-config",
-            str(config_path),
             "--json-output",
             str(json_output_path),
+            "--description-output",
+            str(description_output_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--provider-config",
+            str(config_path),
+            "--upload-description",
         ]
     )
 
     assert exit_code == 0
-    assert captured == {
-        "input_path": input_path,
-        "month": "2026-03",
-        "birth_date": "2025-12-20",
-        "baby_name": "小满",
-        "output_path": output_path,
-        "providers": ["fast-a"],
-        "json_output_path": json_output_path,
-    }
-    assert output_path.read_text(encoding="utf-8") == "# report\n"
-    assert json.loads(json_output_path.read_text(encoding="utf-8")) == {"ok": True}
+    assert captured["album_name"] == "宝宝成长 2026-03"
+    assert captured["upload_description"] is True
+    assert captured["description_output_path"] == description_output_path
+    assert captured["json_output_path"] == json_output_path
+    assert captured["date_from"] is None
+    assert captured["date_to"] is None
 
 
-def test_generate_report_requires_provider_config(tmp_path: Path) -> None:
-    input_path = tmp_path / "descriptions.json"
-    output_path = tmp_path / "report.md"
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
-
-    try:
-        main(
-            [
-                "generate-report",
-                "--input",
-                str(input_path),
-                "--month",
-                "2026-03",
-                "--birth-date",
-                "2025-12-20",
-                "--output",
-                str(output_path),
-            ]
-        )
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected generate-report to require --provider-config")
-
-
-def test_generate_report_requires_birth_date(tmp_path: Path) -> None:
-    input_path = tmp_path / "descriptions.json"
+def test_cli_runs_immich_report_with_date_range_only(monkeypatch, tmp_path: Path) -> None:
     output_path = tmp_path / "report.md"
     config_path = _write_provider_config(tmp_path)
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
-
-    try:
-        main(
-            [
-                "generate-report",
-                "--input",
-                str(input_path),
-                "--month",
-                "2026-03",
-                "--output",
-                str(output_path),
-                "--provider-config",
-                str(config_path),
-            ]
-        )
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected generate-report to require --birth-date")
-
-
-def test_generate_report_requires_baby_name(tmp_path: Path) -> None:
-    input_path = tmp_path / "descriptions.json"
-    output_path = tmp_path / "report.md"
-    config_path = _write_provider_config(tmp_path)
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
-
-    try:
-        main(
-            [
-                "generate-report",
-                "--input",
-                str(input_path),
-                "--month",
-                "2026-03",
-                "--birth-date",
-                "2025-12-20",
-                "--output",
-                str(output_path),
-                "--provider-config",
-                str(config_path),
-            ]
-        )
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected generate-report to require --baby-name")
-
-
-def test_cli_runs_sync_immich_update_asset_description_command(monkeypatch, tmp_path: Path, capsys) -> None:
-    input_path = tmp_path / "descriptions.json"
-    output_path = tmp_path / "sync.json"
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
-    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
 
     captured: dict[str, object] = {}
 
-    async def fake_sync_asset_descriptions_to_immich(
-        *,
-        input_path: Path,
-        immich_url: str,
-        api_key: str,
-        output_path: Path | None = None,
-        match_window_minutes: int = 5,
-        skip_videos: bool = True,
-        dry_run: bool = False,
-        client_transport: object = None,
-    ) -> dict[str, object]:
-        del client_transport
-        captured.update(
-            {
-                "input_path": input_path,
-                "immich_url": immich_url,
-                "api_key": api_key,
-                "output_path": output_path,
-                "match_window_minutes": match_window_minutes,
-                "skip_videos": skip_videos,
-                "dry_run": dry_run,
-            }
-        )
-        return {
-            "summary": {
-                "matched": 2,
-                "updated": 2,
-                "unmatched": 1,
-                "ambiguous": 0,
-            }
-        }
+    async def fake_generate_immich_album_report(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"markdown": "# report\n"}
 
-    monkeypatch.setattr("littlems.cli.sync_asset_descriptions_to_immich", fake_sync_asset_descriptions_to_immich)
+    monkeypatch.setattr("littlems.cli.generate_immich_album_report", fake_generate_immich_album_report)
 
     exit_code = main(
         [
-            "sync-immich",
-            "update-asset-description",
-            "--input",
-            str(input_path),
-            "--immich-url",
-            "http://immich.lan/api",
+            "immich",
+            "report",
+            "--from",
+            "2026-03-01",
+            "--to",
+            "2026-03-31",
+            "--birth-date",
+            "2025-12-20",
+            "--baby-name",
+            "小满",
             "--output",
             str(output_path),
-            "--match-window-minutes",
-            "9",
-            "--dry-run",
+            "--immich-url",
+            "http://immich.lan/api",
+            "--provider-config",
+            str(config_path),
         ]
     )
 
     assert exit_code == 0
-    assert captured == {
-        "input_path": input_path,
-        "immich_url": "http://immich.lan/api",
-        "api_key": "secret-key",
-        "output_path": output_path,
-        "match_window_minutes": 9,
-        "skip_videos": True,
-        "dry_run": True,
-    }
-    assert "Immich asset sync complete: matched=2 updated=2 unmatched=1 ambiguous=0 output=" in capsys.readouterr().out
+    assert captured["album_name"] is None
+    assert captured["date_from"] == "2026-03-01"
+    assert captured["date_to"] == "2026-03-31"
 
 
-def test_sync_immich_requires_api_key_env(tmp_path: Path) -> None:
-    input_path = tmp_path / "descriptions.json"
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
+def test_cli_runs_immich_report_from_description_input(monkeypatch, tmp_path: Path) -> None:
+    output_path = tmp_path / "report.md"
+    description_input_path = tmp_path / "descriptions.json"
+    description_output_path = tmp_path / "descriptions-copy.json"
+    json_output_path = tmp_path / "report.json"
+    config_path = _write_provider_config(tmp_path)
+    description_input_path.write_text(
+        json.dumps(
+            {
+                "source": {"kind": "immich", "scope": "album"},
+                "records": [
+                    {"file_name": "a.jpg", "captured_at": "2026-03-10T10:00:00", "summary": "A", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True, "source_kind": "immich", "source_id": "asset-1", "source_album_name": "宝宝成长 2026-03"},
+                    {"file_name": "b.jpg", "captured_at": "2026-03-18T10:00:00", "summary": "B", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True, "source_kind": "immich", "source_id": "asset-2", "source_album_name": "宝宝成长 2026-03"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_generate_report_for_records(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        Path(kwargs["output_path"]).write_text("# report\n", encoding="utf-8")
+        return {"markdown": "# report\n"}
+
+    async def fake_upload_immich_descriptions_and_report(**kwargs: object) -> None:
+        captured["upload"] = kwargs
+
+    async def fail_generate_immich_album_report(**kwargs: object) -> dict[str, object]:
+        raise AssertionError("generate_immich_album_report should not be called when using --description-input")
+
+    monkeypatch.setattr("littlems.cli.generate_report_for_records", fake_generate_report_for_records)
+    monkeypatch.setattr("littlems.cli.upload_immich_descriptions_and_report", fake_upload_immich_descriptions_and_report)
+    monkeypatch.setattr("littlems.cli.generate_immich_album_report", fail_generate_immich_album_report)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+
+    exit_code = main(
+        [
+            "immich",
+            "report",
+            "--description-input",
+            str(description_input_path),
+            "--album-name",
+            "宝宝成长 2026-03",
+            "--birth-date",
+            "2025-12-20",
+            "--baby-name",
+            "小满",
+            "--output",
+            str(output_path),
+            "--json-output",
+            str(json_output_path),
+            "--description-output",
+            str(description_output_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--upload-description",
+            "--provider-config",
+            str(config_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output_path.read_text(encoding="utf-8") == "# report\n"
+    assert json.loads(description_output_path.read_text(encoding="utf-8"))["source"]["kind"] == "immich"
+    assert captured["source"] == {"kind": "immich", "scope": "album"}
+    assert captured["date_from"] == "2026-03-10"
+    assert captured["date_to"] == "2026-03-18"
+    assert captured["upload"]["album_name"] == "宝宝成长 2026-03"
+    assert captured["upload"]["immich_url"] == "http://immich.lan/api"
+    assert captured["upload"]["api_key"] == "test-key"
+    assert [record["source_id"] for record in captured["upload"]["records"]] == ["asset-1", "asset-2"]
+
+
+def test_cli_rejects_immich_report_description_input_when_album_and_range_are_both_provided(tmp_path: Path) -> None:
+    description_input_path = tmp_path / "descriptions.json"
+    description_input_path.write_text(json.dumps({"records": []}), encoding="utf-8")
+    config_path = _write_provider_config(tmp_path)
 
     try:
         main(
             [
-                "sync-immich",
-                "update-asset-description",
-                "--input",
-                str(input_path),
+                "immich",
+                "report",
+                "--description-input",
+                str(description_input_path),
+                "--album-name",
+                "宝宝成长 2026-03",
+                "--from",
+                "2026-03-01",
+                "--to",
+                "2026-03-31",
+                "--birth-date",
+                "2025-12-20",
+                "--baby-name",
+                "小满",
+                "--output",
+                str(tmp_path / "report.md"),
+                "--provider-config",
+                str(config_path),
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == "immich report with --description-input still requires exactly one selector: either --album-name or both --from and --to"
+    else:
+        raise AssertionError("Expected immich report description-input validation to fail")
+
+
+def test_cli_rejects_immich_report_description_input_upload_without_immich_url(monkeypatch, tmp_path: Path) -> None:
+    description_input_path = tmp_path / "descriptions.json"
+    description_input_path.write_text(
+        json.dumps(
+            {
+                "source": {"kind": "immich", "scope": "album"},
+                "records": [
+                    {"file_name": "a.jpg", "captured_at": "2026-03-10T10:00:00", "summary": "A", "actions": [], "expressions": [], "scene": None, "objects": [], "highlights": [], "uncertainty": None, "baby_present": True, "source_kind": "immich", "source_id": "asset-1", "source_album_name": "宝宝成长 2026-03"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config_path = _write_provider_config(tmp_path)
+
+    async def fake_generate_report_for_records(**kwargs: object) -> dict[str, object]:
+        return {"markdown": "# report\n"}
+
+    monkeypatch.setattr("littlems.cli.generate_report_for_records", fake_generate_report_for_records)
+
+    try:
+        main(
+            [
+                "immich",
+                "report",
+                "--description-input",
+                str(description_input_path),
+                "--album-name",
+                "宝宝成长 2026-03",
+                "--birth-date",
+                "2025-12-20",
+                "--baby-name",
+                "小满",
+                "--output",
+                str(tmp_path / "report.md"),
+                "--provider-config",
+                str(config_path),
+                "--upload-description",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == "immich report requires --immich-url when --upload-description is enabled"
+    else:
+        raise AssertionError("Expected immich report upload validation to fail")
+
+
+def test_cli_rejects_immich_report_when_album_and_range_are_both_provided(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_provider_config(tmp_path)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+
+    try:
+        main(
+            [
+                "immich",
+                "report",
+                "--album-name",
+                "宝宝成长 2026-03",
+                "--from",
+                "2026-03-01",
+                "--to",
+                "2026-03-31",
+                "--birth-date",
+                "2025-12-20",
+                "--baby-name",
+                "小满",
+                "--output",
+                str(tmp_path / "report.md"),
                 "--immich-url",
                 "http://immich.lan/api",
+                "--provider-config",
+                str(config_path),
             ]
         )
     except SystemExit as exc:
-        assert exc.code == "IMMICH_API_KEY environment variable is required for sync-immich"
+        assert exc.code == "immich report requires exactly one selector: either --album-name or both --from and --to"
     else:
-        raise AssertionError("Expected sync-immich update-asset-description to require IMMICH_API_KEY")
+        raise AssertionError("Expected immich report selection validation to fail")
 
 
-def test_sync_immich_requires_subcommand() -> None:
+def test_immich_commands_require_api_key(tmp_path: Path) -> None:
+    config_path = _write_provider_config(tmp_path)
+
     try:
-        main(["sync-immich"])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("Expected sync-immich to require a subcommand")
-
-
-def test_sync_immich_update_asset_description_uses_default_output_path(monkeypatch, tmp_path: Path) -> None:
-    input_path = tmp_path / "descriptions.json"
-    input_path.write_text(json.dumps({"records": []}, ensure_ascii=False), encoding="utf-8")
-    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
-
-    captured: dict[str, object] = {}
-
-    async def fake_sync_asset_descriptions_to_immich(**kwargs: object) -> dict[str, object]:
-        captured.update(kwargs)
-        return {
-            "summary": {
-                "matched": 0,
-                "updated": 0,
-                "unmatched": 0,
-                "ambiguous": 0,
-            }
-        }
-
-    monkeypatch.setattr("littlems.cli.sync_asset_descriptions_to_immich", fake_sync_asset_descriptions_to_immich)
-
-    exit_code = main(
-        [
-            "sync-immich",
-            "update-asset-description",
-            "--input",
-            str(input_path),
-            "--immich-url",
-            "http://immich.lan/api",
-            "--include-videos",
-        ]
-    )
-
-    assert exit_code == 0
-    assert captured["output_path"] == default_asset_sync_output_path(input_path)
-    assert captured["skip_videos"] is False
-
-
-def test_cli_runs_sync_immich_update_album_description_command(monkeypatch, tmp_path: Path, capsys) -> None:
-    report_path = tmp_path / "report.md"
-    output_path = tmp_path / "album-sync.json"
-    report_path.write_text("# report\n", encoding="utf-8")
-    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
-
-    captured: dict[str, object] = {}
-
-    async def fake_sync_album_description_to_immich(
-        *,
-        report_path: Path,
-        month: str,
-        immich_url: str,
-        api_key: str,
-        album_prefix: str = "",
-        output_path: Path | None = None,
-        dry_run: bool = False,
-        client_transport: object = None,
-    ) -> dict[str, object]:
-        del client_transport
-        captured.update(
-            {
-                "report_path": report_path,
-                "month": month,
-                "immich_url": immich_url,
-                "api_key": api_key,
-                "album_prefix": album_prefix,
-                "output_path": output_path,
-                "dry_run": dry_run,
-            }
+        main(
+            [
+                "immich",
+                "describe",
+                "--album-name",
+                "宝宝成长 2026-03",
+                "--output",
+                str(tmp_path / "out.json"),
+                "--immich-url",
+                "http://immich.lan/api",
+                "--provider-config",
+                str(config_path),
+            ]
         )
-        return {
-            "summary": {
-                "updated": 1,
-                "missing_album": 0,
-                "update_failed": 0,
-            }
-        }
-
-    monkeypatch.setattr("littlems.cli.sync_album_description_to_immich", fake_sync_album_description_to_immich)
-
-    exit_code = main(
-        [
-            "sync-immich",
-            "update-album-description",
-            "--report",
-            str(report_path),
-            "--month",
-            "2026-03",
-            "--immich-url",
-            "http://immich.lan/api",
-            "--album-prefix",
-            "宝宝成长",
-            "--output",
-            str(output_path),
-            "--dry-run",
-        ]
-    )
-
-    assert exit_code == 0
-    assert captured == {
-        "report_path": report_path,
-        "month": "2026-03",
-        "immich_url": "http://immich.lan/api",
-        "api_key": "secret-key",
-        "album_prefix": "宝宝成长",
-        "output_path": output_path,
-        "dry_run": True,
-    }
-    assert "Immich album sync complete: updated=1 missing_album=0 update_failed=0 output=" in capsys.readouterr().out
+    except SystemExit as exc:
+        assert exc.code == "IMMICH_API_KEY environment variable is required for immich commands"
+    else:
+        raise AssertionError("Expected immich command to require IMMICH_API_KEY")
 
 
-def test_sync_immich_update_album_description_uses_default_output_path(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "report.md"
-    report_path.write_text("# report\n", encoding="utf-8")
-    monkeypatch.setenv("IMMICH_API_KEY", "secret-key")
-
-    captured: dict[str, object] = {}
-
-    async def fake_sync_album_description_to_immich(**kwargs: object) -> dict[str, object]:
-        captured.update(kwargs)
-        return {
-            "summary": {
-                "updated": 0,
-                "missing_album": 1,
-                "update_failed": 0,
-            }
-        }
-
-    monkeypatch.setattr("littlems.cli.sync_album_description_to_immich", fake_sync_album_description_to_immich)
-
-    exit_code = main(
-        [
-            "sync-immich",
-            "update-album-description",
-            "--report",
-            str(report_path),
-            "--month",
-            "2026-03",
-            "--immich-url",
-            "http://immich.lan/api",
-        ]
-    )
-
-    assert exit_code == 0
-    assert captured["output_path"] == default_album_sync_output_path(report_path)
-
-
-def test_probe_provider_pool_runs_concurrently() -> None:
-    from littlems.cli import _probe_provider_pool
-
-    settings = ProviderPoolSettings(
-        providers=[
-            ProviderSettings("a", "http://a.example/v1", "key-a", "model-a"),
-            ProviderSettings("b", "http://b.example/v1", "key-b", "model-b"),
-            ProviderSettings("c", "http://c.example/v1", "key-c", "model-c"),
-        ]
-    )
-
-    async def run() -> list[dict[str, object]]:
-        import littlems.cli as cli_module
-
-        original = cli_module._probe_provider
-
-        async def fake_probe(provider: ProviderSettings) -> dict[str, object]:
-            await asyncio.sleep(0.05)
-            return {
-                "name": provider.name,
-                "base_url": provider.base_url,
-                "model": provider.vision_model,
-                "ok": True,
-                "error_kind": None,
-                "error": None,
-            }
-
-        cli_module._probe_provider = fake_probe
-        try:
-            started = time.perf_counter()
-            results = await _probe_provider_pool(settings)
-            elapsed = time.perf_counter() - started
-        finally:
-            cli_module._probe_provider = original
-
-        assert elapsed < 0.12
-        return results
-
-    results = asyncio.run(run())
-
-    assert [result["name"] for result in results] == ["a", "b", "c"]
-
-
-def test_classify_http_error_covers_common_statuses() -> None:
-    from littlems.cli import _classify_http_error
-
-    assert _classify_http_error(401) == "unauthorized"
-    assert _classify_http_error(404) == "not_found"
-    assert _classify_http_error(429) == "rate_limited"
-    assert _classify_http_error(503) == "server_error"
-    assert _classify_http_error(418) == "http_error"
-
-
-def _write_provider_config(tmp_path: Path, payload: dict[str, object] | None = None) -> Path:
+def _write_provider_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "providers.json"
     config_path.write_text(
         json.dumps(
-            payload
-            or {
+            {
                 "providers": [
                     {
                         "name": "fast-a",
-                        "base_url": "http://a.example/v1/",
+                        "base_url": "http://a.example/v1",
                         "api_key": "key-a",
                         "vision_model": "model-a",
                         "max_inflight": 2,
                     }
                 ]
-            },
-            ensure_ascii=False,
+            }
         ),
         encoding="utf-8",
     )

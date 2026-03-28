@@ -11,14 +11,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from PIL import ImageOps
+from PIL import Image, ImageOps
 
 from littlems.config import ProviderSettings
 from littlems.exif import extract_photo_metadata
-from littlems.imaging import open_image
+from littlems.imaging import open_image, open_image_bytes
 from littlems.models import (
     PhotoMetadata,
     VisionDescription,
+    VisionInput,
     VisionProvider,
     VisionProviderAttempt,
     VisionResult,
@@ -27,9 +28,12 @@ from littlems.models import (
 logger = logging.getLogger(__name__)
 
 MAX_INLINE_IMAGE_BYTES = 4_000_000
+MAX_MODEL_IMAGE_BYTES = 300 * 1024
 MAX_INLINE_IMAGE_DIMENSION = 4096
 NORMALIZED_IMAGE_DIMENSION = 1536
 NORMALIZED_IMAGE_QUALITY = 80
+MIN_NORMALIZED_IMAGE_DIMENSION = 512
+MIN_NORMALIZED_IMAGE_QUALITY = 35
 DEFAULT_REQUEST_TIMEOUT = 60.0
 ALWAYS_NORMALIZE_SUFFIXES = {"dng", "heif", "heic"}
 
@@ -43,12 +47,14 @@ class OpenAIVisionClient:
 
     async def describe(
         self,
-        image_path: Path,
-        prepared_input: PreparedVisionInput | PhotoMetadata,
+        image_ref: Path | str,
+        prepared_input: PreparedVisionInput | PhotoMetadata | VisionInput,
     ) -> VisionDescription:
         if isinstance(prepared_input, PhotoMetadata):
-            prepared_input = _prepared_input_from_metadata(image_path, prepared_input)
-        logger.debug("building vision request image=%s model=%s", image_path, self._model)
+            prepared_input = _prepared_input_from_metadata(Path(image_ref), prepared_input)
+        elif isinstance(prepared_input, VisionInput):
+            prepared_input = _prepared_input_from_input(prepared_input)
+        logger.debug("building vision request image=%s model=%s", image_ref, self._model)
         schema_payload = _build_payload(
             prepared_input=prepared_input,
             model=self._model,
@@ -59,7 +65,7 @@ class OpenAIVisionClient:
             try:
                 return await self._send_and_parse(
                     client=client,
-                    image_path=image_path,
+                    image_ref=image_ref,
                     payload=schema_payload,
                     format_name="json_schema",
                 )
@@ -68,11 +74,11 @@ class OpenAIVisionClient:
                     raise RuntimeError(f"Vision model request failed: {exc}") from exc
                 logger.warning(
                     "vision request rejected structured format image=%s status=%s body=%s",
-                    image_path,
+                    image_ref,
                     exc.response.status_code,
                     _response_text_excerpt(exc.response),
                 )
-                logger.info("falling back from json_schema to text image=%s", image_path)
+                logger.info("falling back from json_schema to text image=%s", image_ref)
 
             text_payload = _build_payload(
                 prepared_input=prepared_input,
@@ -82,7 +88,7 @@ class OpenAIVisionClient:
             try:
                 return await self._send_and_parse(
                     client=client,
-                    image_path=image_path,
+                    image_ref=image_ref,
                     payload=text_payload,
                     format_name="text",
                 )
@@ -93,11 +99,11 @@ class OpenAIVisionClient:
         self,
         *,
         client: httpx.AsyncClient,
-        image_path: Path,
+        image_ref: str,
         payload: dict[str, object],
         format_name: str,
     ) -> VisionDescription:
-        logger.info("sending vision request image=%s format=%s", image_path, format_name)
+        logger.info("sending vision request image=%s format=%s", image_ref, format_name)
         response = await client.post(
             f"{self._base_url}/chat/completions",
             headers={
@@ -110,14 +116,14 @@ class OpenAIVisionClient:
         if response.is_error:
             logger.warning(
                 "vision request failed image=%s format=%s status=%s body=%s",
-                image_path,
+                image_ref,
                 format_name,
                 response.status_code,
                 _response_text_excerpt(response),
             )
         response.raise_for_status()
         content = _extract_content(response.json())
-        logger.debug("vision response received image=%s format=%s", image_path, format_name)
+        logger.debug("vision response received image=%s format=%s", image_ref, format_name)
         return _parse_description(content)
 
 
@@ -174,6 +180,9 @@ class BalancedVisionClient:
         self._condition = asyncio.Condition()
 
     async def describe(self, image_path: Path, metadata: PhotoMetadata | None = None) -> VisionResult:
+        return await self.describe_path(image_path, metadata=metadata)
+
+    async def describe_path(self, image_path: Path, metadata: PhotoMetadata | None = None) -> VisionResult:
         attempted: set[int] = set()
         provider_attempts: list[VisionProviderAttempt] = []
         prepared_input: PreparedVisionInput | None = None
@@ -234,6 +243,62 @@ class BalancedVisionClient:
                 await self._release_provider(index)
 
         raise VisionProviderFailure(image_path.name, provider_attempts)
+
+    async def describe_input(self, image_input: VisionInput) -> VisionResult:
+        attempted: set[int] = set()
+        provider_attempts: list[VisionProviderAttempt] = []
+        prepared_input = _prepared_input_from_input(image_input)
+
+        while len(attempted) < len(self._providers):
+            index, runtime = await self._acquire_provider(excluded=attempted)
+            started_ns = time.perf_counter_ns()
+            try:
+                description = await runtime.client.describe(image_input.image_name, prepared_input)
+                finished_ns = time.perf_counter_ns()
+                elapsed_ms = _elapsed_ms_between(started_ns, finished_ns)
+                attempt = VisionProviderAttempt(
+                    provider_name=runtime.settings.name,
+                    elapsed_ms=elapsed_ms,
+                    ok=True,
+                    started_at_monotonic_ns=started_ns,
+                    finished_at_monotonic_ns=finished_ns,
+                )
+                provider_attempts.append(attempt)
+                return VisionResult(
+                    provider=VisionProvider(
+                        name=runtime.settings.name,
+                        base_url=runtime.settings.base_url,
+                        model=runtime.settings.vision_model,
+                    ),
+                    description=description,
+                    provider_elapsed_ms=sum(item.elapsed_ms for item in provider_attempts),
+                    provider_attempts=provider_attempts,
+                    metadata=image_input.metadata,
+                )
+            except Exception as exc:
+                finished_ns = time.perf_counter_ns()
+                elapsed_ms = _elapsed_ms_between(started_ns, finished_ns)
+                attempted.add(index)
+                provider_attempts.append(
+                    VisionProviderAttempt(
+                        provider_name=runtime.settings.name,
+                        elapsed_ms=elapsed_ms,
+                        ok=False,
+                        error=str(exc),
+                        started_at_monotonic_ns=started_ns,
+                        finished_at_monotonic_ns=finished_ns,
+                    )
+                )
+                logger.warning(
+                    "provider failed image=%s provider=%s error=%s",
+                    image_input.image_name,
+                    runtime.settings.name,
+                    exc,
+                )
+            finally:
+                await self._release_provider(index)
+
+        raise VisionProviderFailure(image_input.image_name, provider_attempts)
 
     async def _acquire_provider(self, *, excluded: set[int]) -> tuple[int, _ProviderRuntime]:
         async with self._condition:
@@ -372,6 +437,19 @@ def _prepare_vision_input(image_path: Path) -> PreparedVisionInput:
 
 def _prepared_input_from_metadata(image_path: Path, metadata: PhotoMetadata) -> PreparedVisionInput:
     mime_type, image_bytes = _prepare_image_bytes(image_path)
+    return _prepared_input_from_bytes(image_bytes=image_bytes, mime_type=mime_type, metadata=metadata)
+
+
+def _prepared_input_from_input(image_input: VisionInput) -> PreparedVisionInput:
+    mime_type, image_bytes = _prepare_inline_image_bytes(
+        image_bytes=image_input.image_bytes,
+        mime_type=image_input.mime_type,
+        image_name=image_input.image_name,
+    )
+    return _prepared_input_from_bytes(image_bytes=image_bytes, mime_type=mime_type, metadata=image_input.metadata)
+
+
+def _prepared_input_from_bytes(*, image_bytes: bytes, mime_type: str, metadata: PhotoMetadata) -> PreparedVisionInput:
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return PreparedVisionInput(
         metadata=metadata,
@@ -389,7 +467,7 @@ def _prepare_image_bytes(image_path: Path) -> tuple[str, bytes]:
         width, height = image.size
         if (
             suffix not in ALWAYS_NORMALIZE_SUFFIXES
-            and file_size <= MAX_INLINE_IMAGE_BYTES
+            and file_size <= min(MAX_INLINE_IMAGE_BYTES, MAX_MODEL_IMAGE_BYTES)
             and max(width, height) <= MAX_INLINE_IMAGE_DIMENSION
         ):
             return _mime_type_for_suffix(suffix), image_path.read_bytes()
@@ -401,11 +479,10 @@ def _prepare_image_bytes(image_path: Path) -> tuple[str, bytes]:
             height,
             file_size,
         )
-        normalized = ImageOps.exif_transpose(image).convert("RGB")
-        normalized.thumbnail((NORMALIZED_IMAGE_DIMENSION, NORMALIZED_IMAGE_DIMENSION))
-        buffer = io.BytesIO()
-        normalized.save(buffer, format="JPEG", quality=NORMALIZED_IMAGE_QUALITY)
-        normalized_bytes = buffer.getvalue()
+        normalized_bytes = _normalize_to_model_budget(
+            image=ImageOps.exif_transpose(image).convert("RGB"),
+            image_ref=str(image_path),
+        )
     logger.debug(
         "normalized image ready image=%s bytes=%s max_dimension=%s",
         image_path,
@@ -413,6 +490,84 @@ def _prepare_image_bytes(image_path: Path) -> tuple[str, bytes]:
         NORMALIZED_IMAGE_DIMENSION,
     )
     return "image/jpeg", normalized_bytes
+
+
+def _prepare_inline_image_bytes(
+    *,
+    image_bytes: bytes,
+    mime_type: str,
+    image_name: str,
+) -> tuple[str, bytes]:
+    try:
+        with open_image_bytes(image_bytes) as image:
+            width, height = image.size
+            if (
+                len(image_bytes) <= min(MAX_INLINE_IMAGE_BYTES, MAX_MODEL_IMAGE_BYTES)
+                and max(width, height) <= MAX_INLINE_IMAGE_DIMENSION
+            ):
+                return mime_type, image_bytes
+
+            logger.info(
+                "normalizing in-memory image for model input image=%s size=%sx%s bytes=%s",
+                image_name,
+                width,
+                height,
+                len(image_bytes),
+            )
+            normalized_bytes = _normalize_to_model_budget(
+                image=ImageOps.exif_transpose(image).convert("RGB"),
+                image_ref=image_name,
+            )
+            return "image/jpeg", normalized_bytes
+    except Exception:
+        return mime_type, image_bytes
+
+
+def _normalize_to_model_budget(*, image: Image.Image, image_ref: str) -> bytes:
+    current_dimension = min(max(image.size), NORMALIZED_IMAGE_DIMENSION)
+    best_bytes = b""
+    best_quality = NORMALIZED_IMAGE_QUALITY
+
+    while True:
+        resized = image.copy()
+        resized.thumbnail((current_dimension, current_dimension))
+        quality = NORMALIZED_IMAGE_QUALITY
+        while quality >= MIN_NORMALIZED_IMAGE_QUALITY:
+            encoded = _encode_jpeg(resized, quality)
+            best_bytes = encoded
+            best_quality = quality
+            if len(encoded) <= MAX_MODEL_IMAGE_BYTES:
+                logger.debug(
+                    "normalized image within budget image=%s bytes=%s quality=%s max_dimension=%s",
+                    image_ref,
+                    len(encoded),
+                    quality,
+                    current_dimension,
+                )
+                return encoded
+            quality -= 5
+        if current_dimension <= MIN_NORMALIZED_IMAGE_DIMENSION:
+            break
+        next_dimension = max(MIN_NORMALIZED_IMAGE_DIMENSION, round(current_dimension * 0.85))
+        if next_dimension == current_dimension:
+            break
+        current_dimension = next_dimension
+
+    logger.warning(
+        "normalized image still exceeds budget image=%s bytes=%s budget=%s quality=%s max_dimension=%s",
+        image_ref,
+        len(best_bytes),
+        MAX_MODEL_IMAGE_BYTES,
+        best_quality,
+        current_dimension,
+    )
+    return best_bytes
+
+
+def _encode_jpeg(image: Image.Image, quality: int) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return buffer.getvalue()
 
 
 def _mime_type_for_suffix(suffix: str) -> str:

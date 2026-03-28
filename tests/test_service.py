@@ -87,7 +87,7 @@ def test_service_builds_output_document_with_stats(tmp_path: Path) -> None:
         "provider-a": {"processed": 2, "failed": 0, "wall_clock_ms": 24, "wall_clock_ms_avg": 12},
         "provider-b": {"processed": 0, "failed": 0, "wall_clock_ms": 0, "wall_clock_ms_avg": 0},
     }
-    assert document["summary"]["total_files"] == 3
+    assert document["summary"]["total"] == 3
     assert document["summary"]["processed"] == 2
     assert document["summary"]["failed"] == 1
     assert isinstance(document["summary"]["wall_clock_ms"], int)
@@ -101,6 +101,13 @@ def test_service_builds_output_document_with_stats(tmp_path: Path) -> None:
             "provider_name": None,
             "provider_elapsed_ms": 0,
             "provider_attempts": [],
+            "source_kind": "local",
+            "source_id": str((photos / "broken.jpg").resolve()),
+            "source_path": str((photos / "broken.jpg").resolve()),
+            "source_uri": (photos / "broken.jpg").resolve().as_uri(),
+            "source_album_name": None,
+            "existing_description": None,
+            "description_origin": "generated",
         }
     ]
     assert document["records"][0]["gps"] == {
@@ -139,8 +146,8 @@ def test_service_can_write_json_output(tmp_path: Path) -> None:
     assert written["summary"]["skipped"] == 0
     assert written["summary"]["remaining"] == 0
     assert isinstance(written["summary"]["wall_clock_ms"], int)
-    assert written["run_state"]["completed_files"] == [str((photos / "sample.jpg").resolve())]
-    assert written["run_state"]["failed_files"] == []
+    assert written["run_state"]["completed"] == [str((photos / "sample.jpg").resolve())]
+    assert written["run_state"]["failed"] == []
 
 
 def test_service_builds_stats_for_mixed_supported_formats(monkeypatch, tmp_path: Path) -> None:
@@ -190,7 +197,7 @@ def test_service_builds_stats_for_mixed_supported_formats(monkeypatch, tmp_path:
 
     document = asyncio.run(service.describe_directory(photos, recursive=False))
 
-    assert document["summary"]["total_files"] == 2
+    assert document["summary"]["total"] == 2
     assert document["summary"]["processed"] == 2
     assert document["summary"]["failed"] == 0
     assert [item["file_name"] for item in document["records"]] == ["a.heif", "b.dng"]
@@ -246,7 +253,7 @@ def test_service_reports_progress_for_successes_and_failures(tmp_path: Path) -> 
         )
     )
 
-    assert document["summary"]["total_files"] == 2
+    assert document["summary"]["total"] == 2
     assert document["summary"]["processed"] == 1
     assert document["summary"]["failed"] == 1
     assert isinstance(document["summary"]["wall_clock_ms"], int)
@@ -276,7 +283,7 @@ def test_service_handles_empty_directory_without_progress(tmp_path: Path) -> Non
         )
     )
 
-    assert document["summary"]["total_files"] == 0
+    assert document["summary"]["total"] == 0
     assert document["summary"]["processed"] == 0
     assert document["summary"]["failed"] == 0
     assert isinstance(document["summary"]["wall_clock_ms"], int)
@@ -418,7 +425,7 @@ def test_service_accumulates_provider_elapsed_time_for_failure_attempts(tmp_path
 
     document = asyncio.run(service.describe_directory(photos, recursive=False))
 
-    assert document["summary"]["total_files"] == 1
+    assert document["summary"]["total"] == 1
     assert document["summary"]["processed"] == 0
     assert document["summary"]["failed"] == 1
     assert document["provider_stats"] == {
@@ -690,7 +697,7 @@ def test_service_resumes_and_skips_completed_files(tmp_path: Path) -> None:
                     "provider-a": {"processed": 1, "failed": 0, "wall_clock_ms": 5, "wall_clock_ms_avg": 5}
                 },
                 "summary": {
-                    "total_files": 3,
+                    "total": 3,
                     "processed": 1,
                     "failed": 0,
                     "skipped": 0,
@@ -700,8 +707,8 @@ def test_service_resumes_and_skips_completed_files(tmp_path: Path) -> None:
                 "records": [existing_record],
                 "failures": [],
                 "run_state": {
-                    "completed_files": [str((photos / "a.jpg").resolve())],
-                    "failed_files": [],
+                    "completed": [str((photos / "a.jpg").resolve())],
+                    "failed": [],
                     "provider_metrics": {
                         "provider-a": {
                             "attempt_count": 1,
@@ -781,7 +788,7 @@ def test_service_retries_failures_and_replaces_them_with_success(tmp_path: Path)
                     "provider-a": {"processed": 1, "failed": 1, "wall_clock_ms": 12, "wall_clock_ms_avg": 6}
                 },
                 "summary": {
-                    "total_files": 2,
+                    "total": 2,
                     "processed": 1,
                     "failed": 1,
                     "skipped": 0,
@@ -824,8 +831,8 @@ def test_service_retries_failures_and_replaces_them_with_success(tmp_path: Path)
                     }
                 ],
                 "run_state": {
-                    "completed_files": [str((photos / "a.jpg").resolve())],
-                    "failed_files": [str((photos / "b.jpg").resolve())],
+                    "completed": [str((photos / "a.jpg").resolve())],
+                    "failed": [str((photos / "b.jpg").resolve())],
                     "provider_metrics": {
                         "provider-a": {
                             "attempt_count": 2,
@@ -875,10 +882,10 @@ def test_service_rejects_resume_when_input_changes(tmp_path: Path) -> None:
                 "input": {"directory": str((tmp_path / "other").resolve()), "recursive": False},
                 "model": {"provider": "multi_provider_pool", "providers": ["provider-a"]},
                 "provider_stats": {"provider-a": {"processed": 0, "failed": 0, "wall_clock_ms": 0, "wall_clock_ms_avg": 0}},
-                "summary": {"total_files": 0, "processed": 0, "failed": 0, "skipped": 0, "remaining": 0, "wall_clock_ms": 0},
+                "summary": {"total": 0, "processed": 0, "failed": 0, "skipped": 0, "remaining": 0, "wall_clock_ms": 0},
                 "records": [],
                 "failures": [],
-                "run_state": {"completed_files": [], "failed_files": [], "provider_metrics": {}},
+                "run_state": {"completed": [], "failed": [], "provider_metrics": {}},
             },
             ensure_ascii=False,
             indent=2,

@@ -815,7 +815,8 @@ def test_cli_rejects_immich_report_when_album_and_range_are_both_provided(tmp_pa
         raise AssertionError("Expected immich report selection validation to fail")
 
 
-def test_immich_commands_require_api_key(tmp_path: Path) -> None:
+def test_immich_commands_require_api_key(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("IMMICH_API_KEY", raising=False)
     config_path = _write_provider_config(tmp_path)
 
     try:

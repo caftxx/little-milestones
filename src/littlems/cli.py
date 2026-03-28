@@ -579,3 +579,7 @@ def _classify_http_error(status_code: int) -> str:
     if 500 <= status_code:
         return "server_error"
     return "http_error"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

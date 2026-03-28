@@ -1,5 +1,7 @@
 # Little Milestones
 
+[![Tests](https://github.com/caftxx/little-milestones/actions/workflows/tests.yml/badge.svg)](https://github.com/caftxx/little-milestones/actions/workflows/tests.yml)
+
 Support using local AI vision models to analyze photos, extract people-related information, generate monthly reports, and process photos from Immich albums.
 
 ## Setup

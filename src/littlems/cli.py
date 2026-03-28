@@ -75,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Upload generated asset descriptions back to Immich",
     )
+    immich_describe.add_argument(
+        "--force",
+        action="store_true",
+        help="When used with --upload-description, re-upload descriptions for all successful records",
+    )
 
     immich_report = immich_subparsers.add_parser("report", help="Generate a report from an Immich album")
     _add_immich_report_common_arguments(immich_report)
@@ -173,6 +178,8 @@ def _run_local_report(args: argparse.Namespace) -> int:
 
 
 def _run_immich_describe(args: argparse.Namespace) -> int:
+    if args.force and not args.upload_description:
+        raise SystemExit("immich describe --force requires --upload-description")
     api_key = _require_immich_api_key()
     settings = load_provider_settings(args.provider_config)
     vision_client = BalancedVisionClient(settings.providers)
@@ -197,6 +204,7 @@ def _run_immich_describe(args: argparse.Namespace) -> int:
                 provider_names=provider_names,
                 max_workers=args.max_workers,
                 upload_description=args.upload_description,
+                force=args.force,
                 progress_callback=progress_callback,
         ),
         desc="Processing assets",

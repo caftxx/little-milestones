@@ -499,7 +499,7 @@ def _prepare_inline_image_bytes(
     image_name: str,
 ) -> tuple[str, bytes]:
     try:
-        with open_image_bytes(image_bytes) as image:
+        with open_image_bytes(image_bytes, image_name=image_name, mime_type=mime_type) as image:
             width, height = image.size
             if (
                 len(image_bytes) <= min(MAX_INLINE_IMAGE_BYTES, MAX_MODEL_IMAGE_BYTES)

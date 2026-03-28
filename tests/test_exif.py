@@ -7,7 +7,7 @@ import piexif
 import pytest
 from PIL import Image
 
-from littlems.exif import DEFAULT_GPS, extract_photo_metadata
+from littlems.exif import DEFAULT_GPS, extract_photo_metadata, extract_photo_metadata_from_bytes
 
 
 def _write_image(path: Path, exif_dict: dict | None = None) -> None:
@@ -35,6 +35,15 @@ class _EmptyExifImage:
 
     def getexif(self) -> dict[object, object]:
         return {}
+
+
+class _ExifImageWithData(_EmptyExifImage):
+    def getexif(self) -> dict[object, object]:
+        return {
+            271: "Apple",
+            272: "iPhone 15 Pro",
+            306: "2025:01:02 10:11:12",
+        }
 
 
 def test_extract_photo_metadata_prefers_exif_and_parses_fields(tmp_path: Path) -> None:
@@ -84,6 +93,38 @@ def test_extract_photo_metadata_uses_default_gps_when_missing(tmp_path: Path) ->
 
     assert metadata.gps == DEFAULT_GPS
     assert metadata.metadata_source["gps"] == "default_gps"
+
+
+def test_extract_photo_metadata_from_bytes_passes_image_name_and_mime_type(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_open_image_bytes(
+        image_bytes: bytes,
+        *,
+        image_name: str | None = None,
+        mime_type: str | None = None,
+    ) -> _ExifImageWithData:
+        captured["image_bytes"] = image_bytes
+        captured["image_name"] = image_name
+        captured["mime_type"] = mime_type
+        return _ExifImageWithData()
+
+    monkeypatch.setattr("littlems.exif.open_image_bytes", fake_open_image_bytes)
+
+    metadata = extract_photo_metadata_from_bytes(
+        b"dng-bytes",
+        image_name="sample.dng",
+        mime_type="image/x-adobe-dng",
+    )
+
+    assert captured == {
+        "image_bytes": b"dng-bytes",
+        "image_name": "sample.dng",
+        "mime_type": "image/x-adobe-dng",
+    }
+    assert metadata.captured_at == "2025-01-02T10:11:12"
+    assert metadata.device == {"make": "Apple", "model": "iPhone 15 Pro"}
+    assert metadata.gps == DEFAULT_GPS
 
 
 def test_extract_photo_metadata_falls_back_to_filename_datetime(monkeypatch, tmp_path: Path) -> None:

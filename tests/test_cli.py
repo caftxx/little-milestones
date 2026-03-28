@@ -334,6 +334,86 @@ def test_cli_runs_immich_describe_command(monkeypatch, tmp_path: Path) -> None:
     assert progress.n == 3
 
 
+def test_cli_runs_immich_describe_command_with_force(monkeypatch, tmp_path: Path) -> None:
+    output_path = tmp_path / "descriptions.json"
+    config_path = _write_provider_config(tmp_path)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+
+    class StubProgressBar:
+        def __init__(self, total: int, desc: str, unit: str, dynamic_ncols: bool) -> None:
+            self.total = total
+            self.n = 0
+
+        def __enter__(self) -> StubProgressBar:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def refresh(self) -> None:
+            return None
+
+        def update(self, delta: int) -> None:
+            self.n += delta
+
+    captured: dict[str, object] = {}
+
+    async def fake_inspect_immich_resume_state(**kwargs: object):
+        from littlems.immich import ImmichResumeState
+
+        return ImmichResumeState(total_assets=1, skipped=0, failed_to_retry=0, pending=1)
+
+    async def fake_describe_immich_album_to_file(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr("littlems.cli.inspect_immich_resume_state", fake_inspect_immich_resume_state)
+    monkeypatch.setattr("littlems.cli.describe_immich_album_to_file", fake_describe_immich_album_to_file)
+    monkeypatch.setattr("littlems.cli.tqdm", StubProgressBar)
+
+    exit_code = main(
+        [
+            "immich",
+            "describe",
+            "--output",
+            str(output_path),
+            "--immich-url",
+            "http://immich.lan/api",
+            "--provider-config",
+            str(config_path),
+            "--upload-description",
+            "--force",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["force"] is True
+
+
+def test_cli_rejects_force_without_upload_description(tmp_path: Path, monkeypatch) -> None:
+    config_path = _write_provider_config(tmp_path)
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+
+    try:
+        main(
+            [
+                "immich",
+                "describe",
+                "--output",
+                str(tmp_path / "descriptions.json"),
+                "--immich-url",
+                "http://immich.lan/api",
+                "--provider-config",
+                str(config_path),
+                "--force",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == "immich describe --force requires --upload-description"
+    else:
+        raise AssertionError("Expected immich describe --force without --upload-description to fail")
+
+
 def test_cli_runs_immich_describe_without_album_name(monkeypatch, tmp_path: Path) -> None:
     output_path = tmp_path / "descriptions.json"
     config_path = _write_provider_config(tmp_path)

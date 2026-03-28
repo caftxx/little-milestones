@@ -208,6 +208,7 @@ async def describe_immich_album(
     vision_client: object,
     max_workers: int = 16,
     upload_description: bool = False,
+    force: bool = False,
     client_transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, object]:
     return await describe_immich_album_to_file(
@@ -218,6 +219,7 @@ async def describe_immich_album(
         vision_client=vision_client,
         max_workers=max_workers,
         upload_description=upload_description,
+        force=force,
         provider_names=_provider_names_from_client(vision_client),
         client_transport=client_transport,
     )
@@ -262,6 +264,7 @@ async def describe_immich_album_to_file(
     provider_names: list[str],
     max_workers: int = 16,
     upload_description: bool = False,
+    force: bool = False,
     progress_callback: object | None = None,
     client_transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, object]:
@@ -307,7 +310,7 @@ async def describe_immich_album_to_file(
                             client=client,
                             immich_url=immich_url,
                             vision_client=vision_client,
-                            upload_description=upload_description,
+                            upload_description=upload_description and not force,
                         )
                         failure = None
                     except Exception as exc:
@@ -351,6 +354,11 @@ async def describe_immich_album_to_file(
             workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
             await queue.join()
             await asyncio.gather(*workers)
+        if upload_description and force:
+            await _upload_immich_records(
+                client=client,
+                records=[state.records_by_id[asset_id] for asset_id in state.asset_ids if asset_id in state.records_by_id],
+            )
         _write_immich_document(state, status="completed")
         return _build_immich_document(state, status="completed")
 
@@ -440,16 +448,20 @@ async def upload_immich_descriptions_and_report(
     client_transport: httpx.AsyncBaseTransport | None = None,
 ) -> None:
     async with ImmichClient(immich_url, api_key, transport=client_transport) as client:
-        for record in records:
-            if record.get("source_kind") != "immich":
-                continue
-            source_id = record.get("source_id") or record.get("asset_id")
-            if not isinstance(source_id, str) or not source_id:
-                continue
-            await client.update_assets_description([source_id], render_immich_description(record))
+        await _upload_immich_records(client=client, records=records)
         if album_name is not None:
             album = await _find_album(client, album_name)
             await client.update_album_description(album.id, markdown)
+
+
+async def _upload_immich_records(*, client: ImmichClient, records: list[dict[str, object]]) -> None:
+    for record in records:
+        if record.get("source_kind") != "immich":
+            continue
+        source_id = record.get("source_id") or record.get("asset_id")
+        if not isinstance(source_id, str) or not source_id:
+            continue
+        await client.update_assets_description([source_id], render_immich_description(record))
 
 
 async def _find_album(client: ImmichClient, album_name: str) -> ImmichAlbum:
@@ -641,7 +653,15 @@ def parse_immich_description(description: str) -> dict[str, object]:
 
 
 def _metadata_for_asset(asset: ImmichAsset, image_bytes: bytes | None) -> PhotoMetadata:
-    metadata = extract_photo_metadata_from_bytes(image_bytes) if image_bytes is not None else PhotoMetadata()
+    metadata = (
+        extract_photo_metadata_from_bytes(
+            image_bytes,
+            image_name=asset.original_file_name,
+            mime_type=asset.original_mime_type,
+        )
+        if image_bytes is not None
+        else PhotoMetadata()
+    )
     if metadata.captured_at is None:
         for field_name, field_value in (
             ("immich.localDateTime", asset.local_date_time),
@@ -957,6 +977,7 @@ def _validate_immich_resume_payload(
     provider_names: list[str],
     upload_description: bool,
 ) -> None:
+    del upload_description
     if payload.get("version") != DESCRIPTION_DOCUMENT_VERSION:
         raise SystemExit(f"Output file version mismatch: expected {DESCRIPTION_DOCUMENT_VERSION}, got {payload.get('version')}")
     payload_source = _mapping(payload.get("source"))
@@ -969,9 +990,6 @@ def _validate_immich_resume_payload(
     actual_providers = _list_of_strings(model_payload.get("providers"))
     if actual_providers != provider_names:
         raise SystemExit(f"Output file providers do not match current run: {actual_providers} != {provider_names}")
-    actual_upload = bool(_mapping(payload.get("input")).get("upload_description"))
-    if actual_upload != upload_description:
-        raise SystemExit(f"Output file upload_description does not match current run: {actual_upload} != {upload_description}")
 
 
 def _records_by_source_id(value: object) -> dict[str, dict[str, object]]:

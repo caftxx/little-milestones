@@ -31,16 +31,21 @@ def extract_photo_metadata(image_path: Path) -> PhotoMetadata:
         raise RuntimeError("cannot decode") from exc
 
 
-def extract_photo_metadata_from_bytes(image_bytes: bytes) -> PhotoMetadata:
+def extract_photo_metadata_from_bytes(
+    image_bytes: bytes,
+    *,
+    image_name: str | None = None,
+    mime_type: str | None = None,
+) -> PhotoMetadata:
     try:
-        with open_image_bytes(image_bytes) as image:
+        with open_image_bytes(image_bytes, image_name=image_name, mime_type=mime_type) as image:
             metadata = _extract_metadata_from_image(image)
             if metadata.gps is None:
                 metadata.gps = DEFAULT_GPS.copy()
                 metadata.metadata_source["gps"] = "default_gps"
             return metadata
     except UnidentifiedImageError as exc:
-        logger.warning("cannot decode image bytes")
+        logger.warning("cannot decode image bytes image_name=%s mime_type=%s", image_name, mime_type)
         raise RuntimeError("cannot decode") from exc
 
 

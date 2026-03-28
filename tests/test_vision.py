@@ -473,6 +473,41 @@ def test_prepare_inline_image_bytes_normalizes_large_image_under_budget(tmp_path
     assert len(image_bytes) <= MAX_MODEL_IMAGE_BYTES
 
 
+def test_prepare_inline_image_bytes_passes_dng_context_to_decoder(monkeypatch, tmp_path: Path) -> None:
+    image_path = tmp_path / "inline-large.jpg"
+    Image.effect_noise((5000, 4000), 100.0).convert("RGB").save(
+        image_path,
+        format="JPEG",
+        quality=100,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_open_image_bytes(
+        image_bytes: bytes,
+        *,
+        image_name: str | None = None,
+        mime_type: str | None = None,
+    ) -> Image.Image:
+        captured["image_name"] = image_name
+        captured["mime_type"] = mime_type
+        return Image.open(io.BytesIO(image_bytes))
+
+    monkeypatch.setattr("littlems.vision.open_image_bytes", fake_open_image_bytes)
+
+    mime_type, image_bytes = _prepare_inline_image_bytes(
+        image_bytes=image_path.read_bytes(),
+        mime_type="image/x-adobe-dng",
+        image_name="sample.dng",
+    )
+
+    assert captured == {
+        "image_name": "sample.dng",
+        "mime_type": "image/x-adobe-dng",
+    }
+    assert mime_type == "image/jpeg"
+    assert len(image_bytes) <= MAX_MODEL_IMAGE_BYTES
+
+
 def test_prepare_image_bytes_normalizes_heif_into_jpeg(monkeypatch, tmp_path: Path) -> None:
     image_path = tmp_path / "sample.heif"
     image_path.write_bytes(b"heif-data")

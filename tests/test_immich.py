@@ -221,7 +221,10 @@ def test_describe_immich_album_uploads_generated_descriptions(monkeypatch, tmp_p
             return _make_result("宝宝躺着看向前方", metadata=image_input.metadata)
 
     monkeypatch.setattr("littlems.immich.ImmichClient", StubImmichClient)
-    monkeypatch.setattr("littlems.immich.extract_photo_metadata_from_bytes", lambda image_bytes: PhotoMetadata(captured_at="2026-03-10T10:00:00"))
+    monkeypatch.setattr(
+        "littlems.immich.extract_photo_metadata_from_bytes",
+        lambda image_bytes, *, image_name=None, mime_type=None: PhotoMetadata(captured_at="2026-03-10T10:00:00"),
+    )
 
     result = asyncio.run(
         describe_immich_album(
@@ -238,6 +241,99 @@ def test_describe_immich_album_uploads_generated_descriptions(monkeypatch, tmp_p
     assert result["summary"]["processed"] == 1
     assert result["records"][0]["description_origin"] == "generated"
     assert updates == [(["asset-1"], "宝宝躺着看向前方")]
+
+
+def test_describe_immich_album_force_uploads_all_successful_records(monkeypatch, tmp_path: Path) -> None:
+    output_path = tmp_path / "descriptions.json"
+    updates: list[tuple[list[str], str]] = []
+
+    class StubImmichClient:
+        def __init__(self, base_url: str, api_key: str, *, transport: object = None) -> None:
+            return None
+
+        async def __aenter__(self) -> StubImmichClient:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def search_assets(self, *, album_ids: list[str] | None = None, page_size: int = 200) -> list[ImmichAsset]:
+            return [
+                ImmichAsset(id="asset-1", original_file_name="a.jpg", original_path="/library/a.jpg", original_mime_type="image/jpeg", local_date_time="2026-03-10T10:00:00", file_created_at=None, created_at=None, updated_at=None),
+                ImmichAsset(id="asset-2", original_file_name="b.jpg", original_path="/library/b.jpg", original_mime_type="image/jpeg", local_date_time="2026-03-11T10:00:00", file_created_at=None, created_at=None, updated_at=None),
+            ]
+
+        async def get_asset(self, asset_id: str) -> ImmichAsset:
+            return ImmichAsset(id=asset_id, original_file_name=f"{asset_id}.jpg", original_path=f"/library/{asset_id}.jpg", original_mime_type="image/jpeg", local_date_time="2026-03-11T10:00:00", file_created_at=None, created_at=None, updated_at=None)
+
+        async def fetch_asset_original(self, asset_id: str) -> bytes:
+            return b"image-bytes"
+
+        async def update_assets_description(self, asset_ids: list[str], description: str) -> None:
+            updates.append((asset_ids, description))
+
+    class StubVisionClient:
+        async def describe_input(self, image_input: VisionInputLike) -> VisionResult:
+            return _make_result(f"summary-{image_input.image_name}", metadata=image_input.metadata)
+
+    output_path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "status": "completed",
+                "generated_at": "2026-03-22T00:00:00+00:00",
+                "updated_at": "2026-03-22T00:00:00+00:00",
+                "source": {
+                    "kind": "immich",
+                    "scope": "library",
+                    "immich_url": "http://immich.lan/api",
+                    "album_name": None,
+                    "album_id": None,
+                },
+                "model": {"provider": "multi_provider_pool", "providers": ["vision-a"]},
+                "input": {"upload_description": False},
+                "summary": {"wall_clock_ms": 5},
+                "records": [
+                    {
+                        "source_id": "asset-1",
+                        "asset_id": "asset-1",
+                        "source_kind": "immich",
+                        "summary": "existing summary",
+                    }
+                ],
+                "failures": [],
+                "run_state": {"completed": ["asset-1"], "failed": [], "provider_metrics": {}},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("littlems.immich.ImmichClient", StubImmichClient)
+    monkeypatch.setattr(
+        "littlems.immich.extract_photo_metadata_from_bytes",
+        lambda image_bytes, *, image_name=None, mime_type=None: PhotoMetadata(captured_at="2026-03-11T10:00:00"),
+    )
+
+    result = asyncio.run(
+        describe_immich_album_to_file(
+            album_name=None,
+            output_path=output_path,
+            immich_url="http://immich.lan/api",
+            api_key="test-key",
+            vision_client=StubVisionClient(),
+            provider_names=["vision-a"],
+            upload_description=True,
+            force=True,
+        )
+    )
+
+    assert result["summary"]["processed"] == 2
+    assert updates == [
+        (["asset-1"], "existing summary"),
+        (["asset-2"], "summary-asset-2.jpg"),
+    ]
 
 
 def test_describe_immich_album_without_album_name_processes_full_library(monkeypatch, tmp_path: Path) -> None:
@@ -438,7 +534,10 @@ def test_describe_immich_album_to_file_resumes_and_retries_failures(monkeypatch,
             return _make_result("new", metadata=image_input.metadata)
 
     monkeypatch.setattr("littlems.immich.ImmichClient", StubImmichClient)
-    monkeypatch.setattr("littlems.immich.extract_photo_metadata_from_bytes", lambda image_bytes: PhotoMetadata(captured_at="2026-03-11T10:00:00"))
+    monkeypatch.setattr(
+        "littlems.immich.extract_photo_metadata_from_bytes",
+        lambda image_bytes, *, image_name=None, mime_type=None: PhotoMetadata(captured_at="2026-03-11T10:00:00"),
+    )
 
     asyncio.run(
         describe_immich_album_to_file(
@@ -461,7 +560,7 @@ def test_describe_immich_album_to_file_resumes_and_retries_failures(monkeypatch,
     assert seen_asset_ids == ["asset-2"]
 
 
-def test_describe_immich_album_to_file_rejects_mismatched_upload_flag(monkeypatch, tmp_path: Path) -> None:
+def test_describe_immich_album_to_file_allows_mismatched_upload_flag(monkeypatch, tmp_path: Path) -> None:
     output_path = tmp_path / "descriptions.json"
     output_path.write_text(
         json.dumps(
@@ -503,24 +602,39 @@ def test_describe_immich_album_to_file_rejects_mismatched_upload_flag(monkeypatc
         async def search_assets(self, *, album_ids: list[str], page_size: int = 200) -> list[ImmichAsset]:
             return [ImmichAsset(id="asset-1", original_file_name="a.jpg", original_path="/library/a.jpg", original_mime_type="image/jpeg", local_date_time=None, file_created_at=None, created_at=None, updated_at=None)]
 
-    monkeypatch.setattr("littlems.immich.ImmichClient", StubImmichClient)
+        async def get_asset(self, asset_id: str) -> ImmichAsset:
+            return ImmichAsset(id=asset_id, original_file_name="a.jpg", original_path="/library/a.jpg", original_mime_type="image/jpeg", local_date_time="2026-03-10T10:00:00", file_created_at=None, created_at=None, updated_at=None)
 
-    try:
-        asyncio.run(
-            describe_immich_album_to_file(
-                album_name="宝宝成长 2026-03",
-                output_path=output_path,
-                immich_url="http://immich.lan/api",
-                api_key="test-key",
-                vision_client=object(),
-                provider_names=["vision-a"],
-                upload_description=False,
-            )
+        async def fetch_asset_original(self, asset_id: str) -> bytes:
+            return b"image-bytes"
+
+        async def update_assets_description(self, asset_ids: list[str], description: str) -> None:
+            return None
+
+    class StubVisionClient:
+        async def describe_input(self, image_input: VisionInputLike) -> VisionResult:
+            return _make_result("new", metadata=image_input.metadata)
+
+    monkeypatch.setattr("littlems.immich.ImmichClient", StubImmichClient)
+    monkeypatch.setattr(
+        "littlems.immich.extract_photo_metadata_from_bytes",
+        lambda image_bytes, *, image_name=None, mime_type=None: PhotoMetadata(captured_at="2026-03-10T10:00:00"),
+    )
+
+    result = asyncio.run(
+        describe_immich_album_to_file(
+            album_name="宝宝成长 2026-03",
+            output_path=output_path,
+            immich_url="http://immich.lan/api",
+            api_key="test-key",
+            vision_client=StubVisionClient(),
+            provider_names=["vision-a"],
+            upload_description=False,
         )
-    except SystemExit as exc:
-        assert "upload_description does not match" in str(exc)
-    else:
-        raise AssertionError("Expected mismatched upload_description to fail")
+    )
+
+    assert result["status"] == "completed"
+    assert result["summary"]["processed"] == 1
 
 
 def test_generate_immich_album_report_reuses_existing_descriptions(monkeypatch, tmp_path: Path) -> None:
@@ -597,7 +711,10 @@ def test_generate_immich_album_report_reuses_existing_descriptions(monkeypatch, 
             return _make_result("宝宝在垫子上独坐", metadata=image_input.metadata)
 
     monkeypatch.setattr("littlems.immich.ImmichClient", StubImmichClient)
-    monkeypatch.setattr("littlems.immich.extract_photo_metadata_from_bytes", lambda image_bytes: PhotoMetadata(captured_at="2026-03-12T10:00:00"))
+    monkeypatch.setattr(
+        "littlems.immich.extract_photo_metadata_from_bytes",
+        lambda image_bytes, *, image_name=None, mime_type=None: PhotoMetadata(captured_at="2026-03-12T10:00:00"),
+    )
     monkeypatch.setattr("littlems.immich.generate_report_for_records", fake_generate_report_for_records)
 
     result = asyncio.run(
